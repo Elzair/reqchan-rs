@@ -16,6 +16,7 @@ pub fn channel<T>() -> (Sender<T>, Receiver<T>) {
     )
 }
 
+#[derive(Clone)]
 pub struct Sender<T> {
     inner: Arc<Inner<T>>,
 }
@@ -350,5 +351,10 @@ mod tests {
         handle.join().unwrap();
 
         assert_eq!(var.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn test_clone_sender() {
+        
     }
 }
