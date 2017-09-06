@@ -30,6 +30,7 @@ impl Sender {
     }
 }
 
+#[derive(Clone)]
 pub struct Receiver {
     inner: Arc<AtomicBool>,
 }
@@ -37,14 +38,6 @@ pub struct Receiver {
 impl Receiver {
     pub fn receive(&self) -> bool {
         self.inner.compare_and_swap(true, false, Ordering::Relaxed)
-    }
-}
-
-impl Clone for Receiver {
-    fn clone(&self) -> Self {
-        Receiver {
-            inner: self.inner.clone(),
-        }
     }
 }
 
