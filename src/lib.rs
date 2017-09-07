@@ -292,7 +292,6 @@ impl<T> Drop for RequestMonitor<T> {
 }
 
 /// This end of the channel tries to respond to requests from its `Requester`.
-#[derive(Clone)]
 pub struct Responder<T> {
     inner: Arc<Inner<T>>,
 }
@@ -307,6 +306,14 @@ impl<T> Responder<T> {
     ///
     pub fn try_respond(&self, data: T) -> Result<(), TryRespondError<T>> {
         self.inner.try_set_data(data)
+    }
+}
+
+impl<T> Clone for Responder<T> {
+    fn clone(&self) -> Self {
+        Responder {
+            inner: self.inner.clone(),
+        }
     }
 }
 
@@ -723,6 +730,123 @@ mod tests {
         #[allow(unused_variables)]
         let monitor = rqst.try_request().unwrap();
     }
+
+    #[test]
+    fn test_multiple_requests() {
+        let (rqst, resp) = channel::<Task>();
+
+        let var = Arc::new(AtomicUsize::new(0));
+        let var2 = var.clone();
+        let var3 = var.clone();
+
+        // Scope of first monitor
+        {
+            let mut monitor = rqst.try_request().unwrap();
+
+            resp.try_respond(Box::new(move || {
+                var2.fetch_add(1, Ordering::SeqCst);
+            }) as Task).ok().unwrap();
+
+            match monitor.try_receive() {
+                Ok(task) => {
+                    task.call_box();
+                },
+                _ => { assert!(false); },
+            }
+            // `monitor` should drop here freeing up `rqst` 
+        }
+
+        assert_eq!(var.load(Ordering::SeqCst), 1);
+
+        // Scope of second monitor
+        {
+            let mut monitor = rqst.try_request().unwrap();
+
+            resp.try_respond(Box::new(move || {
+                var3.fetch_add(1, Ordering::SeqCst);
+            }) as Task).ok().unwrap();
+
+            match monitor.try_receive() {
+                Ok(task) => {
+                    task.call_box();
+                },
+                _ => { assert!(false); },
+            }
+            // `monitor` should drop here freeing up `rqst` 
+        }
+
+        assert_eq!(var.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn test_multiple_responders() {
+        let (rqst, resp) = channel::<Task>();
+        let resp2 = resp.clone();
+
+        let var = Arc::new(AtomicUsize::new(0));
+        let var2 = var.clone();
+        let var3 = var.clone();
+
+        let task1 = Box::new(move || {
+            var2.fetch_add(2, Ordering::SeqCst);
+        }) as Task;
+        let task2 = Box::new(move || {
+            var3.fetch_add(1, Ordering::SeqCst);
+        }) as Task;
+        
+        let mut monitor = rqst.try_request().unwrap();
+
+        resp.try_respond(task1).ok().unwrap();
+
+        match resp2.try_respond(task2) {
+            Err(TryRespondError::NoRequest(task)) => {
+                task.call_box();
+                var.fetch_sub(1, Ordering::SeqCst);
+            },
+            _ => { assert!(false); },
+        }
+
+        match monitor.try_receive() {
+            Ok(task) => {
+                task.call_box();
+            },
+            _ => { assert!(false); },
+        }
+
+        assert_eq!(var.load(Ordering::SeqCst), 2);
+    }
+
+    // #[test]
+    // fn test_multiple_responders() {
+    //     let (rqst, resp) = channel::<Task>();
+    //     let resp2 = resp.clone();
+
+    //     let var = Arc::new(AtomicUsize::new(0));
+    //     let var2 = var.clone();
+    //     let var3 = var.clone();
+
+    //     let task1 = Box::new(move || {
+    //         var2.fetch_add(1, Ordering::SeqCst);
+    //     }) as Task;
+    //     let task2 = Box::new(move || {
+    //         println!("I am unused!");
+    //     }) as Task;
+    //     let task3 = Box::new(move || {
+    //         var3.fetch_add(1, Ordering::SeqCst);
+    //     }) as Task;
+    //     let task4 = Box::new(move || {
+    //         println!("I am unused!");
+    //     }) as Task;
+        
+    //     {
+    //         let mut monitor = rqst.try_request().unwrap();
+
+    //         resp.try_respond(task1).unwrap();
+            
+    //     }
+
+    //     resp.try_respond(task).ok();
+    // }
 
     #[test]
     fn test_request_receive_threaded() {
