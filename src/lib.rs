@@ -49,7 +49,7 @@
 //!         if start_time.elapsed() >= timeout {
 //!             // Try to cancel request.
 //!             // This should only fail if `responder` has started responding.
-//!             if monitor.try_unsend() {
+//!             if monitor.try_cancel() {
 //!                 // Notify other thread to stop.
 //!                 requester_timeout2.store(true, Ordering::SeqCst);
 //!                 break;
@@ -136,13 +136,13 @@ pub fn channel<T>() -> (Requester<T>, Responder<T>) {
     )
 }
 
-/// This end of the channel requests item(s) and then waits to receive them.
+/// This end of the channel requests item(s)
 pub struct Requester<T> {
     inner: Arc<Inner<T>>,
 }
 
 impl<T> Requester<T> {
-    /// This methods tries to request items from the `Responder` end(s).
+    /// This methods tries to request item(s) from one or more `Responder`(s).
     /// It returns a `RequestMonitor` to poll for data or cancel the request.
     ///
     /// # Warning
@@ -188,12 +188,12 @@ pub struct RequestMonitor<T> {
 }
 
 impl<T> RequestMonitor<T> {
-    /// This method attempts to receive data from the `Responder` end(s).
+    /// This method attempts to receive data from one or more `Responder`(s).
     ///
     /// # Warning
     ///
-    /// It will return an error if the user tries to call it after
-    /// either receiving data or cancelling the request.
+    /// It will return `Err(TryReceiveError::Done)` if the user calls it
+    /// after either receiving data or cancelling the request.
     ///
     /// # Example
     /// 
@@ -242,7 +242,7 @@ impl<T> RequestMonitor<T> {
     ///
     /// # Warning
     ///
-    /// It will return an error if the user tries to call it after
+    /// It will also return `false` if the user calls it after
     /// either receiving data or cancelling the request.
     ///
     /// # Example
@@ -254,18 +254,18 @@ impl<T> RequestMonitor<T> {
     ///
     /// {
     ///     let mut monitor = requester.try_request().unwrap();
-    ///     assert_eq!(monitor.try_unsend(), true);
+    ///     assert_eq!(monitor.try_cancel(), true);
     /// }
     ///
     /// {
     ///     let mut monitor = requester.try_request().unwrap();
     ///     responder.try_respond(5).ok().unwrap();
-    ///     if !monitor.try_unsend() {
+    ///     if !monitor.try_cancel() {
     ///         println!("Number: {}", monitor.try_receive().unwrap());
     ///     }
     /// }
     /// ```
-    pub fn try_unsend(&mut self) -> bool {
+    pub fn try_cancel(&mut self) -> bool {
         // Do not try to unsend if the monitor already received data.
         if self.done {
             return false;
@@ -291,7 +291,7 @@ impl<T> Drop for RequestMonitor<T> {
     }
 }
 
-/// This end of the item tries to send item(s) to its requester end.
+/// This end of the channel tries to respond to requests from its `Requester`.
 #[derive(Clone)]
 pub struct Responder<T> {
     inner: Arc<Inner<T>>,
@@ -676,17 +676,17 @@ mod tests {
     }
 
     #[test]
-    fn test_monitor_try_unsend() {
+    fn test_monitor_try_cancel() {
         #[allow(unused_variables)]
         let (rqst, resp) = channel::<Task>();
 
         let mut monitor = rqst.try_request().unwrap();
 
-        assert_eq!(monitor.try_unsend(), true);
+        assert_eq!(monitor.try_cancel(), true);
     }
 
     #[test]
-    fn test_monitor_try_unsend_too_late() {
+    fn test_monitor_try_cancel_too_late() {
         let (rqst, resp) = channel::<Task>();
 
         let task = Box::new(move || { println!("Hello World!"); }) as Task;
@@ -695,7 +695,7 @@ mod tests {
 
         resp.inner.try_set_data(task).ok();
 
-        assert_eq!(monitor.try_unsend(), false);
+        assert_eq!(monitor.try_cancel(), false);
 
         assert_eq!(monitor.done, false);
 
@@ -703,15 +703,15 @@ mod tests {
     }
 
     #[test]
-    fn test_monitor_try_unsend_done() {
+    fn test_monitor_try_cancel_done() {
         #[allow(unused_variables)]
         let (rqst, resp) = channel::<Task>();
 
         let mut monitor = rqst.try_request().unwrap();
 
-        monitor.try_unsend();
+        monitor.try_cancel();
 
-        assert_eq!(monitor.try_unsend(), false);
+        assert_eq!(monitor.try_cancel(), false);
     }
 
     #[test]
