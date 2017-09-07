@@ -14,13 +14,30 @@
 //! use std::thread;
 //! use std::time::{Duration, Instant};
 //! 
-//! let (requester, responder) = chan::channel::<u32>();
+//! // Stuff required to pass functions around.
+//! trait FnBox {
+//!     fn call_box(self: Box<Self>);
+//! }
+//! impl<F: FnOnce()> FnBox for F {
+//!     fn call_box(self: Box<F>) {
+//!         (*self)()
+//!     }
+//! }
+//! type Task = Box<FnBox + Send + 'static>;
 //! 
-//! let should_stop = Arc::new(AtomicBool::new(false));
-//! let should_stop2 = should_stop.clone();
-//! let should_stop3 = should_stop.clone();
+//! // Variable used to test calling a `Task` sent between threads.
+//! let test_var = Arc::new(AtomicBool::new(false));
+//! let test_var2 = test_var.clone();
 //! 
-//! let handle1 = thread::spawn(move || {
+//! // Variable needed to stop `responder` thread if `requester` times out
+//! let requester_timeout = Arc::new(AtomicBool::new(false));
+//! let requester_timeout2 = requester_timeout.clone();
+//! let requester_timeout3 = requester_timeout.clone();
+//! 
+//! let (requester, responder) = chan::channel::<Task>();
+//! 
+//! // `requester` thread
+//! let requester_handle = thread::spawn(move || {
 //!     let start_time = Instant::now();
 //!     let timeout = Duration::new(0, 1000000);
 //!     
@@ -34,19 +51,19 @@
 //!             // This should only fail if `responder` has started responding.
 //!             if monitor.try_unsend() {
 //!                 // Notify other thread to stop.
-//!                 should_stop2.store(true, Ordering::SeqCst);
+//!                 requester_timeout2.store(true, Ordering::SeqCst);
 //!                 break;
 //!             }
 //!         }
 //! 
-//!         // Try getting data from `responder`.
+//!         // Try getting `task` from `responder`.
 //!         match monitor.try_receive() {
-//!             // `monitor` received `number`.
-//!             Ok(num) => {
-//!                 println!("Number is {}", num);
+//!             // `monitor` received `task`.
+//!             Ok(task) => {
+//!                 task.call_box();
 //!                 break;
 //!             },
-//!             // Continue looping if `responder` has not yet sent `number`.
+//!             // Continue looping if `responder` has not yet sent `task`.
 //!             Err(chan::TryReceiveError::Empty) => {},
 //!             // The only other error is `chan::TryReceiveError::Done`.
 //!             // This only happens if we call `monitor.try_receive()`
@@ -56,21 +73,24 @@
 //!     }
 //! });
 //! 
-//! let handle2 = thread::spawn(move || {
-//!     let mut numbers = vec![5];
+//! // `responder` thread
+//! let responder_handle = thread::spawn(move || {
+//!     let mut tasks = vec![Box::new(move || {
+//!         test_var2.store(true, Ordering::SeqCst);
+//!     }) as Task];
 //!     
 //!     loop {
-//!         // Exit loop if `receiver` has given up.
-//!         if should_stop3.load(Ordering::SeqCst) {
+//!         // Exit loop if `receiver` has timed out.
+//!         if requester_timeout3.load(Ordering::SeqCst) {
 //!             break;
 //!         }
 //!         
-//!         // Send `number` to `receiver` if it has issued a request.
-//!         match responder.try_respond(numbers.pop().unwrap()) {
+//!         // Send `task` to `receiver` if it has issued a request.
+//!         match responder.try_respond(tasks.pop().unwrap()) {
 //!             // If `responder` tries to respond before `requester.try_request()`,
-//!             // put `number` back and continue looping.
-//!             Err(chan::TryRespondError::NoRequest(number)) => {
-//!                 numbers.push(number);
+//!             // put `task` back and continue looping.
+//!             Err(chan::TryRespondError::NoRequest(task)) => {
+//!                 tasks.push(task);
 //!             },
 //!             // `responder` successfully sent response.
 //!             Ok(_) => {
@@ -80,8 +100,11 @@
 //!     }
 //! });
 //! 
-//! handle1.join().unwrap();
-//! handle2.join().unwrap();
+//! requester_handle.join().unwrap();
+//! responder_handle.join().unwrap();
+//!
+//! // Ensure `test_var` has been set.
+//! assert_eq!(test_var.load(Ordering::SeqCst), true);
 //! ```
 
 use std::cell::UnsafeCell;
