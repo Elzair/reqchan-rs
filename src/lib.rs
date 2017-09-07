@@ -298,8 +298,8 @@ pub struct Responder<T> {
 }
 
 impl<T> Responder<T> {
-    /// This method sends item(s) to the requesting end
-    /// *if and only if* that end issued a request. 
+    /// This method sends item(s) to the `RequestMonitor` created by
+    /// its `Requester` *if and only if* that `Requester` issued a request. 
     ///
     /// # Arguments
     ///
