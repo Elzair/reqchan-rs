@@ -35,6 +35,8 @@ impl<T> Requester<T> {
     }
 }
 
+unsafe impl<T> Send for Requester<T> {}
+
 pub struct RequestMonitor<T> {
     inner: Arc<Inner<T>>,
     done: bool,
@@ -95,8 +97,10 @@ pub struct Responder<T> {
     inner: Arc<Inner<T>>,
 }
 
+unsafe impl<T> Send for Responder<T> {}
+
 impl<T> Responder<T> {
-    pub fn try_respond(self, data: T) -> Result<(), TryRespondError<T>> {
+    pub fn try_respond(&self, data: T) -> Result<(), TryRespondError<T>> {
         self.inner.try_set_data(data)
     }
 }
@@ -107,6 +111,8 @@ struct Inner<T> {
     has_data: AtomicBool,
     data: UnsafeCell<Option<T>>,
 }
+
+unsafe impl<T> Sync for Inner<T> {}
 
 impl<T> Inner<T> {
     #[inline]
@@ -200,6 +206,8 @@ pub enum TryRespondError<T> {
 mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::thread;
+    
     use super::*;
 
     trait FnBox {
@@ -509,5 +517,140 @@ mod tests {
 
         #[allow(unused_variables)]
         let monitor = rqst.try_request().unwrap();
+    }
+
+    #[test]
+    fn test_request_receive_threaded() {
+        let (rqst, resp) = channel::<Task>();
+
+        let var = Arc::new(AtomicUsize::new(0));
+        let var2 = var.clone();
+        let var3 = var.clone();
+
+        let handle = thread::spawn(move || {
+            let mut tasks = vec![Box::new(move || {
+                var2.fetch_add(1, Ordering::SeqCst);
+            }) as Task];
+            
+            loop {
+                match resp.try_respond(tasks.pop().unwrap()) {
+                    Err(TryRespondError::NoRequest(task)) => {
+                        tasks.push(task);
+                    },
+                    Ok(_) => {
+                        break;
+                    },
+                }
+            }
+        });
+
+        let mut monitor = rqst.try_request().unwrap();
+
+        loop {
+            match monitor.try_receive() {
+                Ok(task) => {
+                    task.call_box();
+                    assert_eq!(var3.load(Ordering::SeqCst), 1);
+                    break;
+                },
+                Err(TryReceiveError::Empty) => {},
+                Err(TryReceiveError::Done) => { assert!(false); },
+            }
+        }
+
+        handle.join().unwrap();
+
+        assert_eq!(var.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn test_request_threaded_receive() {
+        let (rqst, resp) = channel::<Task>();
+
+        let var = Arc::new(AtomicUsize::new(0));
+        let var2 = var.clone();
+        let var3 = var.clone();
+
+        let handle = thread::spawn(move || {
+            let mut monitor = rqst.try_request().unwrap();
+
+            loop {
+                match monitor.try_receive() {
+                    Ok(task) => {
+                        task.call_box();
+                        assert_eq!(var2.load(Ordering::SeqCst), 1);
+                        break;
+                    },
+                    Err(TryReceiveError::Empty) => {},
+                    Err(TryReceiveError::Done) => { assert!(false); },
+                }
+            }
+        });
+
+        let mut tasks = vec![Box::new(move || {
+            var3.fetch_add(1, Ordering::SeqCst);
+        }) as Task];
+        
+        loop {
+            match resp.try_respond(tasks.pop().unwrap()) {
+                Err(TryRespondError::NoRequest(task)) => {
+                    tasks.push(task);
+                },
+                Ok(_) => {
+                    break;
+                },
+            }
+        }
+
+        handle.join().unwrap();
+
+        assert_eq!(var.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn test_request_threaded_receive_threaded() {
+        let (rqst, resp) = channel::<Task>();
+
+        let var = Arc::new(AtomicUsize::new(0));
+        let var2 = var.clone();
+        let var3 = var.clone();
+
+        let handle1 = thread::spawn(move || {
+            let mut monitor = rqst.try_request().unwrap();
+
+            loop {
+                match monitor.try_receive() {
+                    Ok(task) => {
+                        task.call_box();
+                        assert_eq!(var3.load(Ordering::SeqCst), 1);
+                        break;
+                    },
+                    Err(TryReceiveError::Empty) => {},
+                    Err(TryReceiveError::Done) => { assert!(false); },
+                }
+            }
+        });
+
+        let handle2 = thread::spawn(move || {
+            let mut tasks = vec![Box::new(move || {
+                var2.fetch_add(1, Ordering::SeqCst);
+            }) as Task];
+            
+            loop {
+                match resp.try_respond(tasks.pop().unwrap()) {
+                    Err(TryRespondError::NoRequest(task)) => {
+                        tasks.push(task);
+                    },
+                    Ok(_) => {
+                        break;
+                    },
+                }
+            }
+        });
+
+        handle1.join().unwrap();
+        handle2.join().unwrap();
+
+        assert_eq!(var.load(Ordering::SeqCst), 1);
     }
 }
