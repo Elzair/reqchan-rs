@@ -2,9 +2,6 @@ use std::cell::UnsafeCell;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-// mod request;
-// mod response;
-
 pub fn channel<T>() -> (Requester<T>, Responder<T>) {
     let inner = Arc::new(Inner {
         has_monitor: AtomicBool::new(false),
