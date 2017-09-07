@@ -1,7 +1,104 @@
+//! This crate defines a bidirectional request->response channel.
+//!
+//! It is useful for requesting and then receiving an item from other threads.
+//!
+//! Each channel has only one `Requester`, but it can have multiple `Responder`s.
+//!
+//! # Example
+//!
+//! ```
+//! extern crate reqgetchan as chan;
+//! 
+//! use std::sync::Arc;
+//! use std::sync::atomic::{AtomicBool, Ordering};
+//! use std::thread;
+//! use std::time::{Duration, Instant};
+//! 
+//! let (requester, responder) = chan::channel::<u32>();
+//! 
+//! let should_stop = Arc::new(AtomicBool::new(false));
+//! let should_stop2 = should_stop.clone();
+//! let should_stop3 = should_stop.clone();
+//! 
+//! let handle1 = thread::spawn(move || {
+//!     let start_time = Instant::now();
+//!     let timeout = Duration::new(0, 1000000);
+//!     
+//!     let mut monitor = requester.try_request().unwrap();
+//! 
+//!     loop {
+//!         // Try to cancel request and stop threads if runtime
+//!         // has exceeded `timeout`.
+//!         if start_time.elapsed() >= timeout {
+//!             // Try to cancel request.
+//!             // This should only fail if `responder` has started responding.
+//!             if monitor.try_unsend() {
+//!                 // Notify other thread to stop.
+//!                 should_stop2.store(true, Ordering::SeqCst);
+//!                 break;
+//!             }
+//!         }
+//! 
+//!         // Try getting data from `responder`.
+//!         match monitor.try_receive() {
+//!             // `monitor` received `number`.
+//!             Ok(num) => {
+//!                 println!("Number is {}", num);
+//!                 break;
+//!             },
+//!             // Continue looping if `responder` has not yet sent `number`.
+//!             Err(chan::TryReceiveError::Empty) => {},
+//!             // The only other error is `chan::TryReceiveError::Done`.
+//!             // This only happens if we call `monitor.try_receive()`
+//!             // after either receiving data or cancelling the request.
+//!             _ => unreachable!(),
+//!         }
+//!     }
+//! });
+//! 
+//! let handle2 = thread::spawn(move || {
+//!     let mut numbers = vec![5];
+//!     
+//!     loop {
+//!         // Exit loop if `receiver` has given up.
+//!         if should_stop3.load(Ordering::SeqCst) {
+//!             break;
+//!         }
+//!         
+//!         // Send `number` to `receiver` if it has issued a request.
+//!         match responder.try_respond(numbers.pop().unwrap()) {
+//!             // If `responder` tries to respond before `requester.try_request()`,
+//!             // put `number` back and continue looping.
+//!             Err(chan::TryRespondError::NoRequest(number)) => {
+//!                 numbers.push(number);
+//!             },
+//!             // `responder` successfully sent response.
+//!             Ok(_) => {
+//!                 break;
+//!             },
+//!         }
+//!     }
+//! });
+//! 
+//! handle1.join().unwrap();
+//! handle2.join().unwrap();
+//! ```
+
 use std::cell::UnsafeCell;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+/// This function returns a tuple containing the two ends of this
+/// bidirectional request->response channel.
+///
+/// # Example
+/// 
+/// ```
+/// extern crate reqgetchan;
+///
+/// #[allow(unused_variables)]
+/// let (requester, responder) = reqgetchan::channel::<u32>(); 
+/// ```
 pub fn channel<T>() -> (Requester<T>, Responder<T>) {
     let inner = Arc::new(Inner {
         has_monitor: AtomicBool::new(false),
@@ -16,11 +113,40 @@ pub fn channel<T>() -> (Requester<T>, Responder<T>) {
     )
 }
 
+/// This end of the channel requests item(s) and then waits to receive them.
 pub struct Requester<T> {
     inner: Arc<Inner<T>>,
 }
 
 impl<T> Requester<T> {
+    /// This methods tries to request items from the `Responder` end(s).
+    /// It returns a `RequestMonitor` to poll for data or cancel the request.
+    ///
+    /// # Warning
+    ///
+    /// Only **one** `RequestMonitor` may be active at a time.
+    ///
+    /// # Example
+    /// 
+    /// ```
+    /// extern crate reqgetchan as chan;
+    ///
+    /// let (requester, responder) = chan::channel::<u32>(); 
+    ///
+    /// let mut monitor = requester.try_request().unwrap();
+    ///
+    /// match monitor.try_receive() {
+    ///     Err(chan::TryReceiveError::Empty) => { println!("No Data yet!"); },
+    ///     _ => unreachable!(),
+    /// }
+    /// 
+    /// responder.try_respond(5).ok().unwrap();
+    /// 
+    /// match monitor.try_receive() {
+    ///     Ok(num) => { println!("Number: {}", num); },
+    ///     _ => unreachable!(),
+    /// }
+    /// ```
     pub fn try_request(&self) -> Result<RequestMonitor<T>, TryRequestError> {
         match self.inner.try_flag_request() {
             true => Ok(RequestMonitor {
@@ -32,24 +158,45 @@ impl<T> Requester<T> {
     }
 }
 
-unsafe impl<T> Send for Requester<T> {}
-
+/// This monitors the existing request issued by `Requester`.
 pub struct RequestMonitor<T> {
     inner: Arc<Inner<T>>,
     done: bool,
 }
 
 impl<T> RequestMonitor<T> {
-    // pub fn receive(&mut self) -> T {
-    //     loop {
-    //         if let Ok(data) = self.try_receive() {
-    //             return data;
-    //         }
-    //     }
-    // }
-
+    /// This method attempts to receive data from the `Responder` end(s).
+    ///
+    /// # Warning
+    ///
+    /// It will return an error if the user tries to call it after
+    /// either receiving data or cancelling the request.
+    ///
+    /// # Example
+    /// 
+    /// ```
+    /// extern crate reqgetchan as chan;
+    ///
+    /// let (requester, responder) = chan::channel::<u32>(); 
+    ///
+    /// let mut monitor = requester.try_request().unwrap();
+    ///
+    /// // The responder has not responded yet.
+    /// match monitor.try_receive() {
+    ///     Err(chan::TryReceiveError::Empty) => { println!("No Data yet!"); },
+    ///     _ => unreachable!(),
+    /// }
+    /// 
+    /// responder.try_respond(5).ok().unwrap();
+    /// 
+    /// // The responder has responded now.
+    /// match monitor.try_receive() {
+    ///     Ok(num) => { println!("Number: {}", num); },
+    ///     _ => unreachable!(),
+    /// }
+    /// ```
     pub fn try_receive(&mut self) -> Result<T, TryReceiveError> {
-        // Do not try to receive anything if the monitor is done.
+        // Do not try to receive anything if the monitor already received data.
         if self.done {
             return Err(TryReceiveError::Done);
         }
@@ -63,8 +210,40 @@ impl<T> RequestMonitor<T> {
         }
     } 
 
+    /// This method attempts to cancel the request.
+    ///
+    /// # Return
+    ///
+    /// * `true` - Cancelled request
+    /// * `false` - Responder started processing request first
+    ///
+    /// # Warning
+    ///
+    /// It will return an error if the user tries to call it after
+    /// either receiving data or cancelling the request.
+    ///
+    /// # Example
+    /// 
+    /// ```
+    /// extern crate reqgetchan as chan;
+    ///
+    /// let (requester, responder) = chan::channel::<u32>(); 
+    ///
+    /// {
+    ///     let mut monitor = requester.try_request().unwrap();
+    ///     assert_eq!(monitor.try_unsend(), true);
+    /// }
+    ///
+    /// {
+    ///     let mut monitor = requester.try_request().unwrap();
+    ///     responder.try_respond(5).ok().unwrap();
+    ///     if !monitor.try_unsend() {
+    ///         println!("Number: {}", monitor.try_receive().unwrap());
+    ///     }
+    /// }
+    /// ```
     pub fn try_unsend(&mut self) -> bool {
-        // Do not try to unsend if the monitor is done.
+        // Do not try to unsend if the monitor already received data.
         if self.done {
             return false;
         }
@@ -89,14 +268,20 @@ impl<T> Drop for RequestMonitor<T> {
     }
 }
 
+/// This end of the item tries to send item(s) to its requester end.
 #[derive(Clone)]
 pub struct Responder<T> {
     inner: Arc<Inner<T>>,
 }
 
-unsafe impl<T> Send for Responder<T> {}
-
 impl<T> Responder<T> {
+    /// This method sends item(s) to the requesting end
+    /// *if and only if* that end issued a request. 
+    ///
+    /// # Arguments
+    ///
+    /// * `data` - The item(s) to send
+    ///
     pub fn try_respond(&self, data: T) -> Result<(), TryRespondError<T>> {
         self.inner.try_set_data(data)
     }
@@ -114,7 +299,7 @@ unsafe impl<T> Sync for Inner<T> {}
 impl<T> Inner<T> {
     #[inline]
     fn try_flag_request(&self) -> bool {
-        // Ensure there are no existing requests.
+        // Ensure inner has no existing requests.
         match self.try_add_monitor() {
             true => {
                 self.has_request.store(true, Ordering::SeqCst);
