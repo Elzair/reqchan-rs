@@ -30,18 +30,17 @@
 //! let test_var2 = test_var.clone();
 //! 
 //! // Variable needed to stop `responder` thread if `requester` times out
-//! let requester_timeout = Arc::new(AtomicBool::new(false));
-//! let requester_timeout2 = requester_timeout.clone();
-//! let requester_timeout3 = requester_timeout.clone();
+//! let requester_timed_out = Arc::new(AtomicBool::new(false));
+//! let requester_timed_out_copy = requester_timed_out.clone();
 //! 
 //! let (requester, responder) = chan::channel::<Task>();
 //! 
-//! // `requester` thread
+//! // requesting thread
 //! let requester_handle = thread::spawn(move || {
 //!     let start_time = Instant::now();
 //!     let timeout = Duration::new(0, 1000000);
 //!     
-//!     let mut monitor = requester.try_request().unwrap();
+//!     let mut contract = requester.try_request().unwrap();
 //! 
 //!     loop {
 //!         // Try to cancel request and stop threads if runtime
@@ -49,16 +48,16 @@
 //!         if start_time.elapsed() >= timeout {
 //!             // Try to cancel request.
 //!             // This should only fail if `responder` has started responding.
-//!             if monitor.try_cancel() {
+//!             if contract.try_cancel() {
 //!                 // Notify other thread to stop.
-//!                 requester_timeout2.store(true, Ordering::SeqCst);
+//!                 requester_timed_out.store(true, Ordering::SeqCst);
 //!                 break;
 //!             }
 //!         }
 //! 
 //!         // Try getting `task` from `responder`.
-//!         match monitor.try_receive() {
-//!             // `monitor` received `task`.
+//!         match contract.try_receive() {
+//!             // `contract` received `task`.
 //!             Ok(task) => {
 //!                 task.call_box();
 //!                 break;
@@ -66,14 +65,14 @@
 //!             // Continue looping if `responder` has not yet sent `task`.
 //!             Err(chan::TryReceiveError::Empty) => {},
 //!             // The only other error is `chan::TryReceiveError::Done`.
-//!             // This only happens if we call `monitor.try_receive()`
+//!             // This only happens if we call `contract.try_receive()`
 //!             // after either receiving data or cancelling the request.
 //!             _ => unreachable!(),
 //!         }
 //!     }
 //! });
 //! 
-//! // `responder` thread
+//! // responding thread
 //! let responder_handle = thread::spawn(move || {
 //!     let mut tasks = vec![Box::new(move || {
 //!         test_var2.store(true, Ordering::SeqCst);
@@ -81,21 +80,22 @@
 //!     
 //!     loop {
 //!         // Exit loop if `receiver` has timed out.
-//!         if requester_timeout3.load(Ordering::SeqCst) {
+//!         if requester_timed_out_copy.load(Ordering::SeqCst) {
 //!             break;
 //!         }
 //!         
 //!         // Send `task` to `receiver` if it has issued a request.
-//!         match responder.try_respond(tasks.pop().unwrap()) {
-//!             // If `responder` tries to respond before `requester.try_request()`,
-//!             // put `task` back and continue looping.
-//!             Err(chan::TryRespondError::NoRequest(task)) => {
-//!                 tasks.push(task);
-//!             },
-//!             // `responder` successfully sent response.
-//!             Ok(_) => {
+//!         match responder.try_respond() {
+//!             // `responder` can respond to request.
+//!             Ok(mut contract) => {
+//!                 contract.try_send(tasks.pop().unwrap());
 //!                 break;
 //!             },
+//!             // `requester` has not yet made a request.
+//!             Err(chan::TryRespondError::NoRequest) => {},
+//!             // Since we have created only one `responder`, no clone of
+//!             // `responder` may lock the responding side of this channel.
+//!             Err(chan::TryRespondError::Locked) => unreachable!(),
 //!         }
 //!     }
 //! });
@@ -103,7 +103,7 @@
 //! requester_handle.join().unwrap();
 //! responder_handle.join().unwrap();
 //!
-//! // Ensure `test_var` has been set.
+//! // Ensure receiving thread executed the task.
 //! assert_eq!(test_var.load(Ordering::SeqCst), true);
 //! ```
 
@@ -124,10 +124,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 /// ```
 pub fn channel<T>() -> (Requester<T>, Responder<T>) {
     let inner = Arc::new(Inner {
-        has_monitor: AtomicBool::new(false),
+        has_request_lock: AtomicBool::new(false),
+        has_response_lock: AtomicBool::new(false),
         has_request: AtomicBool::new(false),
-        has_data: AtomicBool::new(false),
-        data: UnsafeCell::new(None),
+        has_datum: AtomicBool::new(false),
+        datum: UnsafeCell::new(None),
     });
 
     (
@@ -143,11 +144,12 @@ pub struct Requester<T> {
 
 impl<T> Requester<T> {
     /// This methods tries to request item(s) from one or more `Responder`(s).
-    /// It returns a `RequestMonitor` to poll for data or cancel the request.
+    /// If successful, it returns a `RequestContract` to either poll for data or
+    /// cancel the request.
     ///
     /// # Warning
     ///
-    /// Only **one** `RequestMonitor` may be active at a time.
+    /// Only **one** `RequestContract` may be active at a time.
     ///
     /// # Example
     /// 
@@ -156,44 +158,51 @@ impl<T> Requester<T> {
     ///
     /// let (requester, responder) = chan::channel::<u32>(); 
     ///
-    /// let mut monitor = requester.try_request().unwrap();
+    /// // Create request.
+    /// let mut request_contract = requester.try_request().unwrap();
+    /// 
+    /// // We have to wait for `request_contract` to go out of scope
+    /// // before we can make another request.
+    /// // match requester.try_request() {
+    /// //     Err(chan::TryRequestError::Locked) => {
+    /// //         println!("We already have a request contract!");
+    /// //     },
+    /// //     _ => unreachable!(),
+    /// // }
     ///
-    /// match monitor.try_receive() {
-    ///     Err(chan::TryReceiveError::Empty) => { println!("No Data yet!"); },
-    ///     _ => unreachable!(),
-    /// }
-    /// 
-    /// responder.try_respond(5).ok().unwrap();
-    /// 
-    /// match monitor.try_receive() {
-    ///     Ok(num) => { println!("Number: {}", num); },
-    ///     _ => unreachable!(),
-    /// }
+    /// responder.try_respond().unwrap().try_send(5).ok().unwrap();
+    /// println!("Got number {}", request_contract.try_receive().unwrap());
     /// ```
-    pub fn try_request(&self) -> Result<RequestMonitor<T>, TryRequestError> {
-        match self.inner.try_flag_request() {
-            true => Ok(RequestMonitor {
-                inner: self.inner.clone(),
-                done: false,
-            }),
-            false => Err(TryRequestError::ExistingRequest),
+    pub fn try_request(&self) -> Result<RequestContract<T>, TryRequestError> {
+        // First, try to lock the requesting side.
+        if !self.inner.try_lock_request() {
+            return Err(TryRequestError::Locked);
         }
+
+        // Next, flag a request.
+        self.inner.flag_request();
+
+        // Then return a `RequestContract`.
+        Ok(RequestContract {
+            inner: self.inner.clone(),
+            done: false,
+        })
     }
 }
 
-/// This monitors the existing request issued by `Requester`.
-pub struct RequestMonitor<T> {
+/// This contracts the existing request issued by `Requester`.
+pub struct RequestContract<T> {
     inner: Arc<Inner<T>>,
     done: bool,
 }
 
-impl<T> RequestMonitor<T> {
-    /// This method attempts to receive data from one or more `Responder`(s).
+impl<T> RequestContract<T> {
+    /// This method attempts to receive a datum from one or more `Responder`(s).
     ///
     /// # Warning
     ///
-    /// It will return `Err(TryReceiveError::Done)` if the user calls it
-    /// after either receiving data or cancelling the request.
+    /// It returns `Err(TryReceiveError::Done)` if the user called it
+    /// after either receiving a datum or cancelling the request.
     ///
     /// # Example
     /// 
@@ -202,38 +211,46 @@ impl<T> RequestMonitor<T> {
     ///
     /// let (requester, responder) = chan::channel::<u32>(); 
     ///
-    /// let mut monitor = requester.try_request().unwrap();
+    /// let mut request_contract = requester.try_request().unwrap();
     ///
-    /// // The responder has not responded yet.
-    /// match monitor.try_receive() {
+    /// // The responder has not responded yet. 
+    /// match request_contract.try_receive() {
     ///     Err(chan::TryReceiveError::Empty) => { println!("No Data yet!"); },
     ///     _ => unreachable!(),
     /// }
     /// 
-    /// responder.try_respond(5).ok().unwrap();
+    /// responder.try_respond().unwrap().try_send(5).ok().unwrap();
     /// 
     /// // The responder has responded now.
-    /// match monitor.try_receive() {
+    /// match request_contract.try_receive() {
     ///     Ok(num) => { println!("Number: {}", num); },
+    ///     _ => unreachable!(),
+    /// }
+    ///
+    /// // We need to issue another request to receive more data.
+    /// match request_contract.try_receive() {
+    ///     Err(chan::TryReceiveError::Done) => {
+    ///         println!("We already received data!");
+    ///     },
     ///     _ => unreachable!(),
     /// }
     /// ```
     pub fn try_receive(&mut self) -> Result<T, TryReceiveError> {
-        // Do not try to receive anything if the monitor already received data.
+        // Do not try to receive anything if the contract already received data.
         if self.done {
             return Err(TryReceiveError::Done);
         }
 
-        match self.inner.try_get_data() {
-            Ok(data) => {
+        match self.inner.try_get_datum() {
+            Ok(datum) => {
                 self.done = true;
-                Ok(data)
+                Ok(datum)
             },
             Err(err) => Err(err),
         }
     } 
 
-    /// This method attempts to cancel the request.
+    /// This method attempts to cancel a request.
     ///
     /// # Return
     ///
@@ -242,8 +259,8 @@ impl<T> RequestMonitor<T> {
     ///
     /// # Warning
     ///
-    /// It will also return `false` if the user calls it after
-    /// either receiving data or cancelling the request.
+    /// It also returns `false` if the user called it after
+    /// either receiving a datum or cancelling the request.
     ///
     /// # Example
     /// 
@@ -253,20 +270,30 @@ impl<T> RequestMonitor<T> {
     /// let (requester, responder) = chan::channel::<u32>(); 
     ///
     /// {
-    ///     let mut monitor = requester.try_request().unwrap();
-    ///     assert_eq!(monitor.try_cancel(), true);
+    ///     let mut contract = requester.try_request().unwrap();
+    ///
+    ///     // We can cancel the request since `responder` has not
+    ///     // yet responded to it.
+    ///     assert_eq!(contract.try_cancel(), true);
+    ///
+    ///     // Both contracts go out of scope here
     /// }
     ///
     /// {
-    ///     let mut monitor = requester.try_request().unwrap();
-    ///     responder.try_respond(5).ok().unwrap();
-    ///     if !monitor.try_cancel() {
-    ///         println!("Number: {}", monitor.try_receive().unwrap());
+    ///     let mut request_contract = requester.try_request().unwrap();
+    ///
+    ///     responder.try_respond().unwrap().try_send(5).ok().unwrap();
+    ///
+    ///     // It is too late to cancel the request!
+    ///     if !request_contract.try_cancel() {
+    ///         println!("Number: {}", request_contract.try_receive().unwrap());
     ///     }
+    ///
+    ///     // Both contracts go out of scope here
     /// }
     /// ```
     pub fn try_cancel(&mut self) -> bool {
-        // Do not try to unsend if the monitor already received data.
+        // Do not try to unsend if the contract already received data.
         if self.done {
             return false;
         }
@@ -281,13 +308,13 @@ impl<T> RequestMonitor<T> {
     }
 }
 
-impl<T> Drop for RequestMonitor<T> {
+impl<T> Drop for RequestContract<T> {
     fn drop(&mut self) {
         if !self.done {
-            panic!("Dropping RequestMonitor without receiving value");
+            panic!("Dropping RequestContract without receiving data!");
         }
 
-        self.inner.drop_monitor();
+        self.inner.unlock_request();
     }
 }
 
@@ -297,15 +324,65 @@ pub struct Responder<T> {
 }
 
 impl<T> Responder<T> {
-    /// This method sends item(s) to the `RequestMonitor` created by
-    /// its `Requester` *if and only if* that `Requester` issued a request. 
+    /// This method signals the intent of `Responder` to respond to a request.
+    /// If successful, it returns a `ResponseContract` to ensure the user sends
+    /// a datum.
     ///
-    /// # Arguments
+    /// # Warning
     ///
-    /// * `data` - The item(s) to send
+    /// Only **one** `ResponseContract` may be active at a time.
     ///
-    pub fn try_respond(&self, data: T) -> Result<(), TryRespondError<T>> {
-        self.inner.try_set_data(data)
+    /// # Example
+    /// 
+    /// ```
+    /// extern crate reqgetchan as chan;
+    ///
+    /// let (requester, responder) = chan::channel::<u32>(); 
+    ///
+    /// // `requester` has not yet issued a request.
+    /// match responder.try_respond() {
+    ///     Err(chan::TryRespondError::NoRequest) => {
+    ///         println!("There is no request!");
+    ///     },
+    ///     _ => unreachable!(),
+    /// }
+    ///
+    /// let mut request_contract = requester.try_request().unwrap();
+    ///
+    /// // `requester` has issued a request.
+    /// let mut response_contract = responder.try_respond().unwrap();
+    ///
+    /// // We cannot issue another response to the request.
+    /// match responder.try_respond() {
+    ///     Err(chan::TryRespondError::Locked) => {
+    ///         println!("We cannot issue multiple responses to a request!");
+    ///     },
+    ///     _ => unreachable!(),
+    /// }
+    ///
+    /// response_contract.try_send(5).ok().unwrap();
+    /// 
+    /// println!("Number is {}", request_contract.try_receive().unwrap());
+    /// ```
+    pub fn try_respond(&self) -> Result<ResponseContract<T>,
+                                        TryRespondError> {
+
+        // First try to lock the responding side.
+        if !self.inner.try_lock_response() {
+            return Err(TryRespondError::Locked);
+        }
+        
+        // Next, atomically check for a request and signal a response to it.
+        // If no request exists, drop the lock and return the data.
+        if !self.inner.try_unflag_request() {
+            self.inner.unlock_response();
+            return Err(TryRespondError::NoRequest);
+        }
+     
+        Ok(ResponseContract {
+            inner: self.inner.clone(),
+            done: false,
+        })
     }
 }
 
@@ -317,28 +394,104 @@ impl<T> Clone for Responder<T> {
     }
 }
 
+/// This contracts the existing response issued by `Responder`.
+pub struct ResponseContract<T> {
+    inner: Arc<Inner<T>>,
+    done: bool,
+}
+
+impl<T> ResponseContract<T> {
+    /// This method sends a datum to the `RequestContract` created by
+    /// the requesting end of the channel.
+    ///
+    /// # Arguments
+    ///
+    /// * `datum` - The item(s) to send
+    ///
+    /// # Warning
+    ///
+    /// It returns `Err(TrySendError::Done(datum))` if the user called it
+    /// after sending data once. The error also contains the datum the user
+    /// tried to send. Therefore, the system does not "eat" unsent data.
+    ///
+    /// # Example
+    /// 
+    // /// ```
+    // /// extern crate reqgetchan as chan;
+    // ///
+    // /// let (requester, responder) = chan::channel::<u32>(); 
+    // ///
+    // /// let mut request_contract = requester.try_request().unwrap();
+    // ///
+    // /// let response_contract = responder.try_respond().unwrap();
+    // ///
+    // /// // We send data to the requesting end.
+    // /// response_contract.try_send(9).ok().unwrap();
+    // ///
+    // /// // The response contract returns an error if we try to send
+    // /// // data more than once. It also returns the data
+    // /// match response_contract.try_send(10) {
+    // ///     Err(chan::TrySendError::Done(num)) => {
+    // ///         println!("We can send data only once per request!");
+    // ///         println!("The number we tried to send is {}", num);
+    // ///     }
+    // /// }
+    // /// 
+    // /// println!("Number is {}", response_contract.try_receive().unwrap());
+    // /// ```
+    pub fn try_send(&mut self, datum: T) -> Result<(), TrySendError<T>>  {
+        // Do not try to send data if the contract already sent a datum.
+        if self.done {
+            return Err(TrySendError::Done(datum));
+        }
+
+        self.inner.set_datum(datum);
+        self.done = true;
+
+        Ok(())
+    }
+}
+
+impl<T> Drop for ResponseContract<T> {
+    fn drop(&mut self) {
+        if !self.done {
+            panic!("Dropping ResponseContract without sending data");
+        }
+
+        self.inner.unlock_response();
+    }
+}
+
+
+#[doc(hidden)]
 struct Inner<T> {
-    has_monitor: AtomicBool,
+    has_request_lock: AtomicBool,
+    has_response_lock: AtomicBool,
     has_request: AtomicBool,
-    has_data: AtomicBool,
-    data: UnsafeCell<Option<T>>,
+    has_datum: AtomicBool,
+    datum: UnsafeCell<Option<T>>,
 }
 
 unsafe impl<T> Sync for Inner<T> {}
 
+#[doc(hidden)]
 impl<T> Inner<T> {
+    /// This method indicates that the requesting side has made a request.
+    ///
+    /// # Warning
+    ///
+    /// **ONLY** the requesting side of the channel should call it.
+    ///
+    /// # Invariant
+    ///
+    /// * self.has_request_lock == true
     #[inline]
-    fn try_flag_request(&self) -> bool {
-        // Ensure inner has no existing requests.
-        match self.try_add_monitor() {
-            true => {
-                self.has_request.store(true, Ordering::SeqCst);
-                true
-            },
-            false => false,
-        }
+    fn flag_request(&self) {
+        self.has_request.store(true, Ordering::SeqCst);
     }
 
+    /// This method atomically checks to see if the requesting end
+    /// issued a request and unflag the request.
     #[inline]
     fn try_unflag_request(&self) -> bool {
         let (old, new) = (true, false);
@@ -348,37 +501,56 @@ impl<T> Inner<T> {
                                           Ordering::SeqCst) == old
     }
 
+    /// This method sets the inner datum to the specified value.
+    ///
+    /// # Arguments
+    ///
+    /// * datum - The datum to set
+    ///
+    /// # Warning
+    ///
+    /// **ONLY** the responding side of the channel should call it.
+    ///
+    /// # Invariant
+    ///
+    /// * self.has_response_lock == true
+    ///
+    /// * self.datum.get().is_none() == true
+    ///
+    /// * self.has_datum == false
     #[inline]
-    fn try_set_data(&self, data: T) -> Result<(), TryRespondError<T>> {
-        // First atomically check for a request and signal a response to it.
-        // If no request exists, return the data.
-        if !self.try_unflag_request() {
-            return Err(TryRespondError::NoRequest(data));
-        }
-        
-        // Next update actual data.
+    fn set_datum(&self, data: T) {
+        // First update inner datum.
         unsafe {
-            *self.data.get() = Some(data);
+            *self.datum.get() = Some(data);
         }
 
-        // Then indicate the presence of new data.
-        self.has_data.store(true, Ordering::SeqCst);
-
-        Ok(())
+        // Then indicate the presence of a new datum.
+        self.has_datum.store(true, Ordering::SeqCst);
     }
     
+    /// This method tries to get the datum out of `Inner`.
+    ///
+    /// # Warning
+    ///
+    /// **ONLY** the requesting side of the channel should call it.
+    ///
+    /// # Invariant
+    ///
+    /// * self.has_request_lock == true
+    ///
+    /// * if self.has_datum == true then self.datum.get().is_some() == true
     #[inline]
-    fn try_get_data(&self) -> Result<T, TryReceiveError> {
+    fn try_get_datum(&self) -> Result<T, TryReceiveError> {
         // First check to see if data exists.
         let (old, new) = (true, false);
 
-        if self.has_data.compare_and_swap(old,
-                                          new,
-                                          Ordering::SeqCst) == old {
+        if self.has_datum.compare_and_swap(old,
+                                           new,
+                                           Ordering::SeqCst) == old {
             // If so, retrieve the data and unwrap it from its Option container.
-            // Invariant: self.data.get() == Some(_) iff self.has_data == TRUE 
             unsafe {
-                Ok((*self.data.get()).take().unwrap())
+                Ok((*self.datum.get()).take().unwrap())
             }
         }
         else {
@@ -386,22 +558,40 @@ impl<T> Inner<T> {
         }
     }
 
+    /// This method tries to lock the requesting side of the channel.
+    /// It returns a `boolean` indicating whether or not it succeeded.
     #[inline]
-    fn try_add_monitor(&self) -> bool {
+    fn try_lock_request(&self) -> bool {
         let (old, new) = (false, true);
 
-        self.has_monitor.compare_and_swap(old, new, Ordering::SeqCst) == old
+        self.has_request_lock.compare_and_swap(old, new, Ordering::SeqCst) == old
     }
 
+    /// This method unlocks the requesting side of the channel.
     #[inline]
-    fn drop_monitor(&self) {
-        self.has_monitor.store(false, Ordering::SeqCst);
+    fn unlock_request(&self) {
+        self.has_request_lock.store(false, Ordering::SeqCst);
+    }
+
+    /// This method tries to lock the responding side of the channel.
+    /// It returns a `boolean` indicating whether or not it succeeded.
+    #[inline]
+    fn try_lock_response(&self) -> bool {
+        let (old, new) = (false, true);
+
+        self.has_response_lock.compare_and_swap(old, new, Ordering::SeqCst) == old
+    }
+
+    /// This method unlocks the responding side of the channel.
+    #[inline]
+    fn unlock_response(&self) {
+        self.has_response_lock.store(false, Ordering::SeqCst);
     }
 }
 
 #[derive(Debug)]
 pub enum TryRequestError {
-    ExistingRequest,
+    Locked,
 }
 
 #[derive(Debug)]
@@ -410,8 +600,14 @@ pub enum TryReceiveError {
     Done,
 }
 
-pub enum TryRespondError<T> {
-    NoRequest(T),
+#[derive(Debug)]
+pub enum TryRespondError {
+    NoRequest,
+    Locked,
+}
+
+pub enum TrySendError<T> {
+    Done(T),
 }
 
 #[cfg(test)]
@@ -441,39 +637,77 @@ mod tests {
     }
    
     #[test]
-    fn test_inner_try_add_monitor() {
+    fn test_inner_try_lock_request() {
         #[allow(unused_variables)]
         let (rqst, resp) = channel::<Task>();
 
-        assert_eq!(rqst.inner.try_add_monitor(), true);
-        assert_eq!(resp.inner.has_monitor.load(Ordering::SeqCst), true);
-
-        assert_eq!(rqst.inner.try_add_monitor(), false);
+        assert_eq!(rqst.inner.try_lock_request(), true);
+        assert_eq!(resp.inner.has_request_lock.load(Ordering::SeqCst), true);
     }
-    
+       
     #[test]
-    fn test_inner_try_drop_monitor() {
+    fn test_inner_try_lock_request_multiple() {
         #[allow(unused_variables)]
         let (rqst, resp) = channel::<Task>();
 
-        rqst.inner.has_monitor.store(true, Ordering::SeqCst);
+        rqst.inner.try_lock_request();
 
-        rqst.inner.drop_monitor();
-        assert_eq!(resp.inner.has_monitor.load(Ordering::SeqCst), false);
+        assert_eq!(rqst.inner.try_lock_request(), false);
     }
 
     #[test]
-    fn test_inner_try_flag_request() {
+    fn test_inner_try_unlock_request() {
         #[allow(unused_variables)]
         let (rqst, resp) = channel::<Task>();
 
-        assert_eq!(rqst.inner.try_flag_request(), true);
+        rqst.inner.has_request_lock.store(true, Ordering::SeqCst);
+
+        rqst.inner.unlock_request();
+        
+        assert_eq!(resp.inner.has_request_lock.load(Ordering::SeqCst), false);
+    }
+      
+    #[test]
+    fn test_inner_try_lock_response() {
+        #[allow(unused_variables)]
+        let (rqst, resp) = channel::<Task>();
+
+        assert_eq!(rqst.inner.try_lock_response(), true);
+        assert_eq!(resp.inner.has_response_lock.load(Ordering::SeqCst), true);
+    }
+       
+    #[test]
+    fn test_inner_try_lock_response_multiple() {
+        #[allow(unused_variables)]
+        let (rqst, resp) = channel::<Task>();
+
+        rqst.inner.try_lock_response();
+
+        assert_eq!(rqst.inner.try_lock_response(), false);
+    }
+
+    #[test]
+    fn test_inner_try_unlock_response() {
+        #[allow(unused_variables)]
+        let (rqst, resp) = channel::<Task>();
+
+        rqst.inner.has_response_lock.store(true, Ordering::SeqCst);
+
+        rqst.inner.unlock_response();
+
+        assert_eq!(resp.inner.has_response_lock.load(Ordering::SeqCst), false);
+    }
+
+    #[test]
+    fn test_inner_flag_request() {
+        #[allow(unused_variables)]
+        let (rqst, resp) = channel::<Task>();
+
+        rqst.inner.flag_request();
+
         assert_eq!(resp.inner.has_request.load(Ordering::SeqCst), true);
-        assert_eq!(resp.inner.has_monitor.load(Ordering::SeqCst), true);
-
-        assert_eq!(rqst.inner.try_flag_request(), false);
     }
-  
+
     #[test]
     fn test_inner_try_unflag_request() {
         #[allow(unused_variables)]
@@ -488,47 +722,31 @@ mod tests {
     }
    
     #[test]
-    fn test_inner_try_set_data_with_request() {
+    fn test_inner_try_unflag_request_multiple() {
+        #[allow(unused_variables)]
+        let (rqst, resp) = channel::<Task>();
+
+        resp.inner.has_request.store(true, Ordering::SeqCst);
+
+        rqst.inner.try_unflag_request();
+
+        assert_eq!(rqst.inner.try_unflag_request(), false);
+    }
+
+    #[test]
+    fn test_inner_set_datum() {
         #[allow(unused_variables)]
         let (rqst, resp) = channel::<Task>();
 
         let task = Box::new(move || { println!("Hello World!"); }) as Task;
 
-        rqst.inner.has_request.store(true, Ordering::SeqCst);
+        resp.inner.set_datum(task);
 
-        match resp.inner.try_set_data(task) {
-            Ok(_) => {},
-            _ => { assert!(false); },
-        }
-
-        assert_eq!(resp.inner.has_data.load(Ordering::SeqCst), true);
+        assert_eq!(resp.inner.has_datum.load(Ordering::SeqCst), true);
     }
-   
+  
     #[test]
-    fn test_inner_try_set_data_no_request() {
-        #[allow(unused_variables)]
-        let (rqst, resp) = channel::<Task>();
-
-        let var = Arc::new(AtomicUsize::new(0));
-        let var2 = var.clone();
-
-        let task = Box::new(move || {
-            var2.fetch_add(1, Ordering::SeqCst);
-        }) as Task;
-
-        match resp.inner.try_set_data(task) {
-            Err(TryRespondError::NoRequest(task)) => {
-                task.call_box();
-                assert_eq!(var.load(Ordering::SeqCst), 1);
-            },
-            _ => { assert!(false); },
-        }
-
-        assert_eq!(resp.inner.has_data.load(Ordering::SeqCst), false);
-    }
- 
-    #[test]
-    fn test_inner_try_get_data_with_data() {
+    fn test_inner_try_get_datum_with_data() {
         #[allow(unused_variables)]
         let (rqst, resp) = channel::<Task>();
 
@@ -540,11 +758,11 @@ mod tests {
         }) as Task;
 
         unsafe {
-            *resp.inner.data.get() = Some(task);
+            *resp.inner.datum.get() = Some(task);
         }
-        resp.inner.has_data.store(true, Ordering::SeqCst);
+        resp.inner.has_datum.store(true, Ordering::SeqCst);
              
-        match rqst.inner.try_get_data() {
+        match rqst.inner.try_get_datum() {
             Ok(t) => {
                 t.call_box();
                 assert_eq!(var.load(Ordering::SeqCst), 1);
@@ -554,11 +772,11 @@ mod tests {
     }
  
     #[test]
-    fn test_inner_try_get_data_no_data() {
+    fn test_inner_try_get_datum_no_data() {
         #[allow(unused_variables)]
         let (rqst, resp) = channel::<Task>();
         
-        match rqst.inner.try_get_data() {
+        match rqst.inner.try_get_datum() {
             Err(TryReceiveError::Empty) => {}
             _ => { assert!(false); },
         }
@@ -569,40 +787,26 @@ mod tests {
         #[allow(unused_variables)]
         let (rqst, resp) = channel::<Task>();
 
-        let mut monitor = rqst.try_request().unwrap();
+        let mut contract = rqst.try_request().unwrap();
 
-        monitor.done = true;
+        contract.done = true;
     }
 
     #[test]
-    fn test_requester_try_request_disallow_multiple() {
+    fn test_requester_try_request_multiple() {
         #[allow(unused_variables)]
         let (rqst, resp) = channel::<Task>();
 
-        let mut monitor = rqst.try_request().unwrap();
+        rqst.inner.try_lock_request();
 
         match rqst.try_request() {
-            Err(TryRequestError::ExistingRequest) => {},
+            Err(TryRequestError::Locked) => {},
             _ => { assert!(false); },
         }
-
-        monitor.done = true;
     }
 
     #[test]
-    fn test_responder_try_respond() {
-        let (rqst, resp) = channel::<Task>();
-
-        let task = Box::new(move || { println!("Hello World!"); }) as Task;
-        
-        rqst.inner.try_flag_request();
-
-        resp.try_respond(task).ok();
-    }
-
-    #[test]
-    fn test_responder_try_respond_no_request() {
-        #[allow(unused_variables)]
+    fn test_request_contract_try_receive() {
         let (rqst, resp) = channel::<Task>();
 
         let var = Arc::new(AtomicUsize::new(0));
@@ -612,123 +816,184 @@ mod tests {
             var2.fetch_add(1, Ordering::SeqCst);
         }) as Task;
 
-        match resp.try_respond(task) {
-            Err(TryRespondError::NoRequest(task)) => {
-                task.call_box();
-                assert_eq!(var.load(Ordering::SeqCst), 1);
-            },
-            _ => { assert!(false); },
-        }
-    }
+        let mut contract = rqst.try_request().unwrap();
 
-    #[test]
-    fn test_monitor_try_receive() {
-        let (rqst, resp) = channel::<Task>();
+        resp.inner.set_datum(task);
 
-        let var = Arc::new(AtomicUsize::new(0));
-        let var2 = var.clone();
-
-        let task = Box::new(move || {
-            var2.fetch_add(1, Ordering::SeqCst);
-        }) as Task;
-
-        let mut monitor = rqst.try_request().unwrap();
-
-        resp.inner.try_set_data(task).ok();
-
-        match monitor.try_receive() {
+        match contract.try_receive() {
             Ok(task) => {
                 task.call_box();
-                assert_eq!(var.load(Ordering::SeqCst), 1);
             },
             _ => { assert!(false); },
         }
 
-        assert_eq!(monitor.done, true);
+        assert_eq!(contract.done, true);
+        assert_eq!(var.load(Ordering::SeqCst), 1);
     }
 
     #[test]
-    fn test_monitor_try_receive_no_data() {
+    fn test_request_contract_try_receive_no_data() {
         #[allow(unused_variables)]
         let (rqst, resp) = channel::<Task>();
 
-        let mut monitor = rqst.try_request().unwrap();
+        let mut contract = rqst.try_request().unwrap();
 
-        match monitor.try_receive() {
+        match contract.try_receive() {
             Err(TryReceiveError::Empty) => {},
             _ => { assert!(false); },
         }
 
-        assert_eq!(monitor.done, false);
+        assert_eq!(contract.done, false);
 
-        monitor.done = true;
+        contract.done = true;
     }
     
     #[test]
-    fn test_monitor_try_receive_done() {
+    fn test_request_contract_try_receive_done() {
+        #[allow(unused_variables)]
         let (rqst, resp) = channel::<Task>();
 
-        let task = Box::new(move || { println!("Hello World!"); }) as Task;
+        let mut contract = rqst.try_request().unwrap();
 
-        let mut monitor = rqst.try_request().unwrap();
+        contract.done = true;
 
-        resp.inner.try_set_data(task).ok();
-
-        monitor.try_receive().ok();
-
-        match monitor.try_receive() {
+        match contract.try_receive() {
             Err(TryReceiveError::Done) => {},
             _ => { assert!(false); },
         }
     }
 
     #[test]
-    fn test_monitor_try_cancel() {
+    fn test_request_contract_try_cancel() {
         #[allow(unused_variables)]
         let (rqst, resp) = channel::<Task>();
 
-        let mut monitor = rqst.try_request().unwrap();
+        let mut contract = rqst.try_request().unwrap();
 
-        assert_eq!(monitor.try_cancel(), true);
+        assert_eq!(contract.try_cancel(), true);
     }
 
     #[test]
-    fn test_monitor_try_cancel_too_late() {
+    fn test_request_contract_try_cancel_too_late() {
+        #[allow(unused_variables)]
         let (rqst, resp) = channel::<Task>();
-
-        let task = Box::new(move || { println!("Hello World!"); }) as Task;
         
-        let mut monitor = rqst.try_request().unwrap();
+        let mut contract = rqst.try_request().unwrap();
 
-        resp.inner.try_set_data(task).ok();
+        rqst.inner.try_unflag_request();
 
-        assert_eq!(monitor.try_cancel(), false);
+        assert_eq!(contract.try_cancel(), false);
+        assert_eq!(contract.done, false);
 
-        assert_eq!(monitor.done, false);
-
-        monitor.done = true;
+        contract.done = true;
     }
 
     #[test]
-    fn test_monitor_try_cancel_done() {
+    fn test_request_contract_try_cancel_done() {
         #[allow(unused_variables)]
         let (rqst, resp) = channel::<Task>();
 
-        let mut monitor = rqst.try_request().unwrap();
+        let mut contract = rqst.try_request().unwrap();
 
-        monitor.try_cancel();
+        contract.done = true;
 
-        assert_eq!(monitor.try_cancel(), false);
+        assert_eq!(contract.try_cancel(), false);
     }
 
     #[test]
     #[should_panic]
-    fn test_monitor_drop_without_receiving_data() {
+    fn test_request_contract_drop_without_receiving_data() {
         #[allow(unused_variables)]
         let (rqst, resp) = channel::<Task>();
 
         #[allow(unused_variables)]
-        let monitor = rqst.try_request().unwrap();
+        let contract = rqst.try_request().unwrap();
+    }
+
+    #[test]
+    fn test_responder_try_respond() {
+        let (rqst, resp) = channel::<Task>();
+        
+        rqst.inner.flag_request();
+
+        let mut contract = resp.try_respond().unwrap();
+
+        contract.done = true;
+    }
+
+    #[test]
+    fn test_responder_try_respond_no_request() {
+        #[allow(unused_variables)]
+        let (rqst, resp) = channel::<Task>();
+        
+        match resp.try_respond() {
+            Err(TryRespondError::NoRequest) => {},
+            _ => { assert!(false); },
+        }
+    }
+
+    #[test]
+    fn test_responder_try_respond_multiple() {
+        #[allow(unused_variables)]
+        let (rqst, resp) = channel::<Task>();
+
+        resp.inner.try_lock_response();
+        
+        match resp.try_respond() {
+            Err(TryRespondError::Locked) => {},
+            _ => { assert!(false); },
+        }
+    }
+
+    #[test]
+    fn test_response_contract_try_send() {
+        let (rqst, resp) = channel::<Task>();
+
+        rqst.inner.flag_request();
+
+        let mut contract = resp.try_respond().unwrap();
+
+        contract.try_send(Box::new(move || { println!("Hello World!"); }) as Task).ok().unwrap();
+
+        assert_eq!(contract.done, true);
+    }
+
+    #[test]
+    fn test_response_contract_try_send_already_sent() {
+        let (rqst, resp) = channel::<Task>();
+
+        let var = Arc::new(AtomicUsize::new(0));
+        let var2 = var.clone();
+
+        let task1 = Box::new(move || { println!("Hello World!"); }) as Task;
+        let task2 = Box::new(move || {
+            var2.fetch_add(1, Ordering::SeqCst);
+        }) as Task;
+
+        rqst.inner.flag_request();
+
+        let mut contract = resp.try_respond().unwrap();
+
+        contract.try_send(task1).ok().unwrap();
+
+        match contract.try_send(task2) {
+            Err(TrySendError::Done(task)) => {
+                task.call_box();
+            },
+            _ => { assert!(false); },
+        }
+
+        assert_eq!(var.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_response_contract_drop_without_sending_data() {
+        #[allow(unused_variables)]
+        let (rqst, resp) = channel::<Task>();
+
+        #[allow(unused_variables)]
+        let contract = resp.try_respond().unwrap();
     }
 
     #[test]
@@ -739,40 +1004,44 @@ mod tests {
         let var2 = var.clone();
         let var3 = var.clone();
 
-        // Scope of first monitor
+        // Scope of first set of contracts
         {
-            let mut monitor = rqst.try_request().unwrap();
+            let mut rqst_con = rqst.try_request().unwrap();
+            let mut resp_con = resp.try_respond().unwrap();
 
-            resp.try_respond(Box::new(move || {
+            resp_con.try_send(Box::new(move || {
                 var2.fetch_add(1, Ordering::SeqCst);
             }) as Task).ok().unwrap();
 
-            match monitor.try_receive() {
+            match rqst_con.try_receive() {
                 Ok(task) => {
                     task.call_box();
                 },
                 _ => { assert!(false); },
             }
-            // `monitor` should drop here freeing up `rqst` 
+            // `resp_con` should drop here freeing up `resp` 
+            // `rqst_con` should drop here freeing up `rqst` 
         }
 
         assert_eq!(var.load(Ordering::SeqCst), 1);
 
-        // Scope of second monitor
+        // Scope of second set of contracts
         {
-            let mut monitor = rqst.try_request().unwrap();
+            let mut rqst_con = rqst.try_request().unwrap();
+            let mut resp_con = resp.try_respond().unwrap();
 
-            resp.try_respond(Box::new(move || {
+            resp_con.try_send(Box::new(move || {
                 var3.fetch_add(1, Ordering::SeqCst);
             }) as Task).ok().unwrap();
 
-            match monitor.try_receive() {
+            match rqst_con.try_receive() {
                 Ok(task) => {
                     task.call_box();
                 },
                 _ => { assert!(false); },
             }
-            // `monitor` should drop here freeing up `rqst` 
+            // `resp_con` should drop here freeing up `resp` 
+            // `rqst_con` should drop here freeing up `rqst` 
         }
 
         assert_eq!(var.load(Ordering::SeqCst), 2);
@@ -785,68 +1054,28 @@ mod tests {
 
         let var = Arc::new(AtomicUsize::new(0));
         let var2 = var.clone();
-        let var3 = var.clone();
-
-        let task1 = Box::new(move || {
-            var2.fetch_add(2, Ordering::SeqCst);
-        }) as Task;
-        let task2 = Box::new(move || {
-            var3.fetch_add(1, Ordering::SeqCst);
-        }) as Task;
         
-        let mut monitor = rqst.try_request().unwrap();
+        let mut rqst_con = rqst.try_request().unwrap();
+        let mut resp_con = resp.try_respond().unwrap();
 
-        resp.try_respond(task1).ok().unwrap();
-
-        match resp2.try_respond(task2) {
-            Err(TryRespondError::NoRequest(task)) => {
-                task.call_box();
-                var.fetch_sub(1, Ordering::SeqCst);
-            },
+        match resp2.try_respond() {
+            Err(TryRespondError::Locked) => {},
             _ => { assert!(false); },
         }
 
-        match monitor.try_receive() {
+        resp_con.try_send(Box::new(move || {
+            var2.fetch_add(1, Ordering::SeqCst);
+        }) as Task).ok().unwrap();
+
+        match rqst_con.try_receive() {
             Ok(task) => {
                 task.call_box();
             },
             _ => { assert!(false); },
         }
 
-        assert_eq!(var.load(Ordering::SeqCst), 2);
+        assert_eq!(var.load(Ordering::SeqCst), 1);
     }
-
-    // #[test]
-    // fn test_multiple_responders() {
-    //     let (rqst, resp) = channel::<Task>();
-    //     let resp2 = resp.clone();
-
-    //     let var = Arc::new(AtomicUsize::new(0));
-    //     let var2 = var.clone();
-    //     let var3 = var.clone();
-
-    //     let task1 = Box::new(move || {
-    //         var2.fetch_add(1, Ordering::SeqCst);
-    //     }) as Task;
-    //     let task2 = Box::new(move || {
-    //         println!("I am unused!");
-    //     }) as Task;
-    //     let task3 = Box::new(move || {
-    //         var3.fetch_add(1, Ordering::SeqCst);
-    //     }) as Task;
-    //     let task4 = Box::new(move || {
-    //         println!("I am unused!");
-    //     }) as Task;
-        
-    //     {
-    //         let mut monitor = rqst.try_request().unwrap();
-
-    //         resp.try_respond(task1).unwrap();
-            
-    //     }
-
-    //     resp.try_respond(task).ok();
-    // }
 
     #[test]
     fn test_request_receive_threaded() {
@@ -854,32 +1083,28 @@ mod tests {
 
         let var = Arc::new(AtomicUsize::new(0));
         let var2 = var.clone();
-        let var3 = var.clone();
 
         let handle = thread::spawn(move || {
-            let mut tasks = vec![Box::new(move || {
-                var2.fetch_add(1, Ordering::SeqCst);
-            }) as Task];
-            
             loop {
-                match resp.try_respond(tasks.pop().unwrap()) {
-                    Err(TryRespondError::NoRequest(task)) => {
-                        tasks.push(task);
-                    },
-                    Ok(_) => {
+                match resp.try_respond() {
+                    Ok(mut contract) => {
+                        contract.try_send(Box::new(move || {
+                            var2.fetch_add(1, Ordering::SeqCst);
+                        }) as Task).ok().unwrap();
                         break;
                     },
+                    Err(TryRespondError::NoRequest) => {},
+                    Err(TryRespondError::Locked) => { assert!(false); },
                 }
             }
         });
 
-        let mut monitor = rqst.try_request().unwrap();
+        let mut contract = rqst.try_request().unwrap();
 
         loop {
-            match monitor.try_receive() {
+            match contract.try_receive() {
                 Ok(task) => {
                     task.call_box();
-                    assert_eq!(var3.load(Ordering::SeqCst), 1);
                     break;
                 },
                 Err(TryReceiveError::Empty) => {},
@@ -898,16 +1123,14 @@ mod tests {
 
         let var = Arc::new(AtomicUsize::new(0));
         let var2 = var.clone();
-        let var3 = var.clone();
 
         let handle = thread::spawn(move || {
-            let mut monitor = rqst.try_request().unwrap();
+            let mut contract = rqst.try_request().unwrap();
 
             loop {
-                match monitor.try_receive() {
+                match contract.try_receive() {
                     Ok(task) => {
                         task.call_box();
-                        assert_eq!(var2.load(Ordering::SeqCst), 1);
                         break;
                     },
                     Err(TryReceiveError::Empty) => {},
@@ -916,18 +1139,16 @@ mod tests {
             }
         });
 
-        let mut tasks = vec![Box::new(move || {
-            var3.fetch_add(1, Ordering::SeqCst);
-        }) as Task];
-        
         loop {
-            match resp.try_respond(tasks.pop().unwrap()) {
-                Err(TryRespondError::NoRequest(task)) => {
-                    tasks.push(task);
-                },
-                Ok(_) => {
+            match resp.try_respond() {
+                Ok(mut contract) => {
+                    contract.try_send(Box::new(move || {
+                        var2.fetch_add(1, Ordering::SeqCst);
+                    }) as Task).ok().unwrap();
                     break;
                 },
+                Err(TryRespondError::NoRequest) => {},
+                Err(TryRespondError::Locked) => { assert!(false); },
             }
         }
 
@@ -942,16 +1163,14 @@ mod tests {
 
         let var = Arc::new(AtomicUsize::new(0));
         let var2 = var.clone();
-        let var3 = var.clone();
 
         let handle1 = thread::spawn(move || {
-            let mut monitor = rqst.try_request().unwrap();
+            let mut contract = rqst.try_request().unwrap();
 
             loop {
-                match monitor.try_receive() {
+                match contract.try_receive() {
                     Ok(task) => {
                         task.call_box();
-                        assert_eq!(var3.load(Ordering::SeqCst), 1);
                         break;
                     },
                     Err(TryReceiveError::Empty) => {},
@@ -961,18 +1180,16 @@ mod tests {
         });
 
         let handle2 = thread::spawn(move || {
-            let mut tasks = vec![Box::new(move || {
-                var2.fetch_add(1, Ordering::SeqCst);
-            }) as Task];
-            
             loop {
-                match resp.try_respond(tasks.pop().unwrap()) {
-                    Err(TryRespondError::NoRequest(task)) => {
-                        tasks.push(task);
-                    },
-                    Ok(_) => {
+                match resp.try_respond() {
+                    Ok(mut contract) => {
+                        contract.try_send(Box::new(move || {
+                            var2.fetch_add(1, Ordering::SeqCst);
+                        }) as Task).ok().unwrap();
                         break;
                     },
+                    Err(TryRespondError::NoRequest) => {},
+                    Err(TryRespondError::Locked) => { assert!(false); },
                 }
             }
         });
