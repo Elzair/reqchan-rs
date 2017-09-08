@@ -190,14 +190,18 @@ impl<T> Requester<T> {
     }
 }
 
-/// This contracts the existing request issued by `Requester`.
+/// This is the contract returned by a successful `Requester::try_request()`.
+/// It represents the caller's exclusive access to the requesting side of
+/// the channel. The user can either poll for a datum from the responding side 
+/// or *attempt* to cancel the request. To prevent data loss, the user must
+/// either receive a datum or cancel the request. 
 pub struct RequestContract<T> {
     inner: Arc<Inner<T>>,
     done: bool,
 }
 
 impl<T> RequestContract<T> {
-    /// This method attempts to receive a datum from one or more `Responder`(s).
+    /// This method attempts to receive a datum from one or more responder(s).
     ///
     /// # Warning
     ///
@@ -401,8 +405,7 @@ pub struct ResponseContract<T> {
 }
 
 impl<T> ResponseContract<T> {
-    /// This method sends a datum to the `RequestContract` created by
-    /// the requesting end of the channel.
+    /// This method sends a datum to the requesting end of the channel.
     ///
     /// # Arguments
     ///
@@ -416,29 +419,30 @@ impl<T> ResponseContract<T> {
     ///
     /// # Example
     /// 
-    // /// ```
-    // /// extern crate reqgetchan as chan;
-    // ///
-    // /// let (requester, responder) = chan::channel::<u32>(); 
-    // ///
-    // /// let mut request_contract = requester.try_request().unwrap();
-    // ///
-    // /// let response_contract = responder.try_respond().unwrap();
-    // ///
-    // /// // We send data to the requesting end.
-    // /// response_contract.try_send(9).ok().unwrap();
-    // ///
-    // /// // The response contract returns an error if we try to send
-    // /// // data more than once. It also returns the data
-    // /// match response_contract.try_send(10) {
-    // ///     Err(chan::TrySendError::Done(num)) => {
-    // ///         println!("We can send data only once per request!");
-    // ///         println!("The number we tried to send is {}", num);
-    // ///     }
-    // /// }
-    // /// 
-    // /// println!("Number is {}", response_contract.try_receive().unwrap());
-    // /// ```
+    /// ```
+    /// extern crate reqgetchan as chan;
+    ///
+    /// let (requester, responder) = chan::channel::<u32>(); 
+    ///
+    /// let mut request_contract = requester.try_request().unwrap();
+    ///
+    /// let mut response_contract = responder.try_respond().unwrap();
+    ///
+    /// // We send data to the requesting end.
+    /// response_contract.try_send(9).ok().unwrap();
+    ///
+    /// // The response contract returns an error if we try to send
+    /// // data more than once. It also returns the data
+    /// match response_contract.try_send(10) {
+    ///     Err(chan::TrySendError::Done(num)) => {
+    ///         println!("We can send data only once per request!");
+    ///         println!("The number we tried to send is {}", num);
+    ///     },
+    ///     _ => unreachable!(),
+    /// }
+    /// 
+    /// println!("Number is {}", request_contract.try_receive().unwrap());
+    /// ```
     pub fn try_send(&mut self, datum: T) -> Result<(), TrySendError<T>>  {
         // Do not try to send data if the contract already sent a datum.
         if self.done {
