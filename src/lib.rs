@@ -4,7 +4,27 @@
 //!
 //! Each channel has only one `Requester`, but it can have multiple `Responder`s.
 //!
-//! # Example
+//! # Examples 
+//! 
+//! ## Simple Example
+//! 
+//! ```
+//! extern crate reqgetchan;
+//!
+//! // Create channel.
+//! let (requester, responder) = reqgetchan::channel::<u32>(); 
+//!
+//! // Issue request.
+//! let mut request_contract = requester.try_request().unwrap();
+//!
+//! // Respond with number.
+//! responder.try_respond().unwrap().try_send(5).ok().unwrap();
+//!
+//! // Receive and print number.
+//! println!("Number is {}", request_contract.try_receive().unwrap());
+//! ```
+//!
+//! ## More Complex Example 
 //!
 //! ```
 //! extern crate reqgetchan as chan;
@@ -88,7 +108,7 @@
 //!         match responder.try_respond() {
 //!             // `responder` can respond to request.
 //!             Ok(mut contract) => {
-//!                 contract.try_send(tasks.pop().unwrap());
+//!                 contract.try_send(tasks.pop().unwrap()).ok().unwrap();
 //!                 break;
 //!             },
 //!             // `requester` has not yet made a request.
@@ -111,8 +131,8 @@ use std::cell::UnsafeCell;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-/// This function returns a tuple containing the two ends of this
-/// bidirectional request->response channel.
+/// This function creates a `reqgetchan` and returns a tuple containing the
+/// two ends of this bidirectional request->response channel.
 ///
 /// # Example
 /// 
@@ -192,9 +212,9 @@ impl<T> Requester<T> {
 
 /// This is the contract returned by a successful `Requester::try_request()`.
 /// It represents the caller's exclusive access to the requesting side of
-/// the channel. The user can either poll for a datum from the responding side 
-/// or *attempt* to cancel the request. To prevent data loss, the user must
-/// either receive a datum or cancel the request. 
+/// the channel. The user can either try to get a datum from the responding side
+/// or *attempt* to cancel the request. To prevent data loss, `RequestContract`
+/// will panic if the user has not received a datum or cancelled the request.
 pub struct RequestContract<T> {
     inner: Arc<Inner<T>>,
     done: bool,
@@ -398,14 +418,16 @@ impl<T> Clone for Responder<T> {
     }
 }
 
-/// This contracts the existing response issued by `Responder`.
+/// This is the contract returned by a successful `Responder::try_response()`.
+/// It represents the caller's exclusive access to the responding side of
+/// the channel. It ensures the user sends a datum by panicking if they have not.
 pub struct ResponseContract<T> {
     inner: Arc<Inner<T>>,
     done: bool,
 }
 
 impl<T> ResponseContract<T> {
-    /// This method sends a datum to the requesting end of the channel.
+    /// This method tries to send a datum to the requesting end of the channel.
     ///
     /// # Arguments
     ///
