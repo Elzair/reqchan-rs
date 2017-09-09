@@ -2,8 +2,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread;
 
-extern crate reqgetchan;
-use reqgetchan::*;
+extern crate reqchan;
+use reqchan::*;
 
 trait FnBox {
     fn call_box(self: Box<Self>);

@@ -1,8 +1,8 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-extern crate reqgetchan;
-use reqgetchan::*;
+extern crate reqchan;
+use reqchan::*;
 
 trait FnBox {
     fn call_box(self: Box<Self>);
@@ -18,7 +18,7 @@ type Task = Box<FnBox + Send + 'static>;
 
 #[test]
 fn test_multiple_requests() {
-    let (rqst, resp) = reqgetchan::channel::<Task>();
+    let (rqst, resp) = channel::<Task>();
 
     let var = Arc::new(AtomicUsize::new(0));
     let var2 = var.clone();

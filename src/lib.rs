@@ -12,10 +12,10 @@
 //! The only thing left out is `RequestContract::try_cancel()`.
 //!
 //! ```
-//! extern crate reqgetchan;
+//! extern crate reqchan;
 //!
 //! // Create channel.
-//! let (requester, responder) = reqgetchan::channel::<u32>(); 
+//! let (requester, responder) = reqchan::channel::<u32>(); 
 //!
 //! // Issue request.
 //! let mut request_contract = requester.try_request().unwrap();
@@ -32,7 +32,7 @@
 //! This more complex example demonstrates more "real-world" usage.
 //!
 //! ```
-//! extern crate reqgetchan as chan;
+//! extern crate reqchan as chan;
 //! 
 //! use std::sync::Arc;
 //! use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -172,16 +172,16 @@ use std::cell::UnsafeCell;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-/// This function creates a `reqgetchan` and returns a tuple containing the
+/// This function creates a `reqchan` and returns a tuple containing the
 /// two ends of this bidirectional request->response channel.
 ///
 /// # Example
 /// 
 /// ```
-/// extern crate reqgetchan;
+/// extern crate reqchan;
 ///
 /// #[allow(unused_variables)]
-/// let (requester, responder) = reqgetchan::channel::<u32>(); 
+/// let (requester, responder) = reqchan::channel::<u32>(); 
 /// ```
 pub fn channel<T>() -> (Requester<T>, Responder<T>) {
     let inner = Arc::new(Inner {
@@ -215,7 +215,7 @@ impl<T> Requester<T> {
     /// # Example
     /// 
     /// ```
-    /// extern crate reqgetchan as chan;
+    /// extern crate reqchan as chan;
     ///
     /// let (requester, responder) = chan::channel::<u32>(); 
     ///
@@ -272,7 +272,7 @@ impl<T> RequestContract<T> {
     /// # Example
     /// 
     /// ```
-    /// extern crate reqgetchan as chan;
+    /// extern crate reqchan as chan;
     ///
     /// let (requester, responder) = chan::channel::<u32>(); 
     ///
@@ -331,7 +331,7 @@ impl<T> RequestContract<T> {
     /// # Example
     /// 
     /// ```
-    /// extern crate reqgetchan as chan;
+    /// extern crate reqchan as chan;
     ///
     /// let (requester, responder) = chan::channel::<u32>(); 
     ///
@@ -402,7 +402,7 @@ impl<T> Responder<T> {
     /// # Example
     /// 
     /// ```
-    /// extern crate reqgetchan as chan;
+    /// extern crate reqchan as chan;
     ///
     /// let (requester, responder) = chan::channel::<u32>(); 
     ///
@@ -485,7 +485,7 @@ impl<T> ResponseContract<T> {
     /// # Example
     /// 
     /// ```
-    /// extern crate reqgetchan as chan;
+    /// extern crate reqchan as chan;
     ///
     /// let (requester, responder) = chan::channel::<u32>(); 
     ///
