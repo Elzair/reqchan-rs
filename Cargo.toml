@@ -1,6 +1,8 @@
 [package]
 name = "reqchan"
-version = "0.5.1"
+version = "0.5.2"
 authors = ["Philip Woods <elzairthesorcerer@gmail.com>"]
+description = "A simple Request->Response channel"
+license = "MIT/Apache-2.0"
 
 [dependencies]
