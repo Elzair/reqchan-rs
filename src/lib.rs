@@ -9,12 +9,37 @@
 //!
 //! # Design
 //!
+//! ## Overview
+//!
 //! `reqchan` is built around the two halves of the channel: `Requester`
-//! and `Responder`. Both implement methods that, when succesful, return
-//! contracts which function as lock-guards (and also, in the case of
-//! `RequestContract`, futures). These contracts **require** the user to
-//! either successfully receive data or cancel requests (on the receiving
-//! end) or send data (on the responding end).
+//! and `Responder`. Both implement methods, `Requester::try_request()` and
+//! `Responder::try_respond()`, that, when succesful, lock their corresponding
+//! side of the channel and return contracts. `RequestContract` **requires** the
+//! user to either successfully receive a datum or cancel the request.
+//! `ResponseContract` requires the user to send a datum. These requirements
+//! prevent the system from losing data sent through the channel.
+//!
+//! ## Locking 
+//!
+//! `Responder::try_response()` locks the responding side to prevent other
+//! potential responders from responding to the same request. However,
+//! `Requester::try_request()` locks the requesting side of the channel
+//! to prevent the user from trying to issue multiple outstanding requests.
+//! Both locks are dropped when their corresponding contract object is dropped.
+//!
+//! ## Contracts 
+//!
+//! `Requester::try_request()` has to issue a `RequestContract` so the
+//! thread of execution does not block waiting for a response. However,
+//! that reason does not apply to `Responder::try_response()`. I originally
+//! made `Responder::try_response()` send the datum. However, that required
+//! the user to have the datum available to send even if it could not be sent,
+//! and it required the user to handle the returned datum if it could not be
+//! sent. If the datum was, say, half the contents of a `Vec`, this might entail
+//! lots of expensive memory allocation. Therefore, I made `Responder::try_response()`
+//! return a `ResponseContract` indicating that the responder *could* and *would*
+//! respond to the request. This way the user only has to perform the necessary
+//! steps to send the datum if the datum must be sent.
 //!
 //! # Examples 
 //! 
