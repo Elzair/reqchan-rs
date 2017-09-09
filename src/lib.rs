@@ -8,6 +8,9 @@
 //! 
 //! ## Simple Example
 //! 
+//! This simple, single-threaded example demonstrates most of the API.
+//! The only thing left out is `RequestContract::try_cancel()`.
+//!
 //! ```
 //! extern crate reqgetchan;
 //!
@@ -25,6 +28,8 @@
 //! ```
 //!
 //! ## More Complex Example 
+//!
+//! This more complex example demonstrates more "real-world" usage.
 //!
 //! ```
 //! extern crate reqgetchan as chan;
@@ -310,12 +315,13 @@ impl<T> RequestContract<T> {
         }
     } 
 
-    /// This method attempts to cancel a request.
+    /// This method attempts to cancel a request. This is useful for
+    /// implementing a timeout.
     ///
     /// # Return
     ///
     /// * `true` - Cancelled request
-    /// * `false` - Responder started processing request first
+    /// * `false` - `Responder` started processing request first
     ///
     /// # Warning
     ///
