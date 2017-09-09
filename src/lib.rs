@@ -1,6 +1,6 @@
-//! This crate defines a bidirectional request->response channel.
+//! This crate defines a channel for requesting and receiving data.
 //!
-//! It is useful for requesting and then receiving an item from other threads.
+//! It is useful for requesting and then receiving a datum from other threads.
 //!
 //! Each channel has only one `Requester`, but it can have multiple `Responder`s.
 //!
@@ -30,7 +30,7 @@
 //! extern crate reqgetchan as chan;
 //! 
 //! use std::sync::Arc;
-//! use std::sync::atomic::{AtomicBool, Ordering};
+//! use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 //! use std::thread;
 //! use std::time::{Duration, Instant};
 //! 
@@ -46,14 +46,17 @@
 //! type Task = Box<FnBox + Send + 'static>;
 //! 
 //! // Variable used to test calling a `Task` sent between threads.
-//! let test_var = Arc::new(AtomicBool::new(false));
+//! let test_var = Arc::new(AtomicUsize::new(0));
 //! let test_var2 = test_var.clone();
+//! let test_var3 = test_var.clone();
 //! 
 //! // Variable needed to stop `responder` thread if `requester` times out
-//! let requester_timed_out = Arc::new(AtomicBool::new(false));
-//! let requester_timed_out_copy = requester_timed_out.clone();
+//! let should_exit = Arc::new(AtomicBool::new(false));
+//! let should_exit_copy_1 = should_exit.clone();
+//! let should_exit_copy_2 = should_exit.clone();
 //! 
 //! let (requester, responder) = chan::channel::<Task>();
+//! let responder2 = responder.clone();
 //! 
 //! // requesting thread
 //! let requester_handle = thread::spawn(move || {
@@ -69,8 +72,8 @@
 //!             // Try to cancel request.
 //!             // This should only fail if `responder` has started responding.
 //!             if contract.try_cancel() {
-//!                 // Notify other thread to stop.
-//!                 requester_timed_out.store(true, Ordering::SeqCst);
+//!                 // Notify other threads to stop.
+//!                 should_exit.store(true, Ordering::SeqCst);
 //!                 break;
 //!             }
 //!         }
@@ -80,6 +83,8 @@
 //!             // `contract` received `task`.
 //!             Ok(task) => {
 //!                 task.call_box();
+//!                 // Notify other threads to stop.
+//!                 should_exit.store(true, Ordering::SeqCst);
 //!                 break;
 //!             },
 //!             // Continue looping if `responder` has not yet sent `task`.
@@ -92,39 +97,70 @@
 //!     }
 //! });
 //! 
-//! // responding thread
-//! let responder_handle = thread::spawn(move || {
+//! // responding thread 1
+//! let responder_1_handle = thread::spawn(move || {
 //!     let mut tasks = vec![Box::new(move || {
-//!         test_var2.store(true, Ordering::SeqCst);
+//!         test_var2.fetch_add(1, Ordering::SeqCst);
 //!     }) as Task];
 //!     
 //!     loop {
 //!         // Exit loop if `receiver` has timed out.
-//!         if requester_timed_out_copy.load(Ordering::SeqCst) {
+//!         if should_exit_copy_1.load(Ordering::SeqCst) {
+//!             break;
+//!         }
+//!         
+//!         // Send `task` to `receiver` if it has issued a request.
+//!         match responder2.try_respond() {
+//!             // `responder2` can respond to request.
+//!             Ok(mut contract) => {
+//!                 contract.try_send(tasks.pop().unwrap()).ok().unwrap();
+//!                 break;
+//!             },
+//!             // Either `requester` has not yet made a request,
+//!             // or `responder2` already handled the request.
+//!             Err(chan::TryRespondError::NoRequest) => {},
+//!             // `responder2` is processing request..
+//!             Err(chan::TryRespondError::Locked) => { break; },
+//!         }
+//!     }
+//! });
+//! 
+//! // responding thread 2
+//! let responder_2_handle = thread::spawn(move || {
+//!     let mut tasks = vec![Box::new(move || {
+//!         test_var3.fetch_add(2, Ordering::SeqCst);
+//!     }) as Task];
+//!     
+//!     loop {
+//!         // Exit loop if `receiver` has timed out.
+//!         if should_exit_copy_2.load(Ordering::SeqCst) {
 //!             break;
 //!         }
 //!         
 //!         // Send `task` to `receiver` if it has issued a request.
 //!         match responder.try_respond() {
-//!             // `responder` can respond to request.
+//!             // `responder2` can respond to request.
 //!             Ok(mut contract) => {
 //!                 contract.try_send(tasks.pop().unwrap()).ok().unwrap();
 //!                 break;
 //!             },
-//!             // `requester` has not yet made a request.
+//!             // Either `requester` has not yet made a request,
+//!             // or `responder` already handled the request.
 //!             Err(chan::TryRespondError::NoRequest) => {},
-//!             // Since we have created only one `responder`, no clone of
-//!             // `responder` may lock the responding side of this channel.
-//!             Err(chan::TryRespondError::Locked) => unreachable!(),
+//!             // `responder` is processing request.
+//!             Err(chan::TryRespondError::Locked) => { break; },
 //!         }
 //!     }
 //! });
 //! 
 //! requester_handle.join().unwrap();
-//! responder_handle.join().unwrap();
+//! responder_1_handle.join().unwrap();
+//! responder_2_handle.join().unwrap();
 //!
 //! // Ensure receiving thread executed the task.
-//! assert_eq!(test_var.load(Ordering::SeqCst), true);
+//! let num = test_var.load(Ordering::SeqCst);
+//! assert!(num > 0);
+//! println!("Number is {}", num);
 //! ```
 
 use std::cell::UnsafeCell;
@@ -157,7 +193,7 @@ pub fn channel<T>() -> (Requester<T>, Responder<T>) {
     )
 }
 
-/// This end of the channel requests item(s)
+/// This end of the channel requests and receives data from its `Responder`(s).
 pub struct Requester<T> {
     inner: Arc<Inner<T>>,
 }
@@ -342,7 +378,8 @@ impl<T> Drop for RequestContract<T> {
     }
 }
 
-/// This end of the channel tries to respond to requests from its `Requester`.
+/// This end of the channel sends data in response to requests from
+/// its `Requester`.
 pub struct Responder<T> {
     inner: Arc<Inner<T>>,
 }
