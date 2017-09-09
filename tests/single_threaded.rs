@@ -27,11 +27,11 @@ fn test_multiple_requests() {
     // Scope of first set of contracts
     {
         let mut rqst_con = rqst.try_request().unwrap();
-        let mut resp_con = resp.try_respond().unwrap();
+        let resp_con = resp.try_respond().unwrap();
 
-        resp_con.try_send(Box::new(move || {
+        resp_con.send(Box::new(move || {
             var2.fetch_add(1, Ordering::SeqCst);
-        }) as Task).ok().unwrap();
+        }) as Task);
 
         match rqst_con.try_receive() {
             Ok(task) => {
@@ -48,11 +48,11 @@ fn test_multiple_requests() {
     // Scope of second set of contracts
     {
         let mut rqst_con = rqst.try_request().unwrap();
-        let mut resp_con = resp.try_respond().unwrap();
+        let resp_con = resp.try_respond().unwrap();
 
-        resp_con.try_send(Box::new(move || {
+        resp_con.send(Box::new(move || {
             var3.fetch_add(1, Ordering::SeqCst);
-        }) as Task).ok().unwrap();
+        }) as Task);
 
         match rqst_con.try_receive() {
             Ok(task) => {
@@ -76,16 +76,16 @@ fn test_multiple_responders() {
     let var2 = var.clone();
     
     let mut rqst_con = rqst.try_request().unwrap();
-    let mut resp_con = resp.try_respond().unwrap();
+    let resp_con = resp.try_respond().unwrap();
 
     match resp2.try_respond() {
         Err(TryRespondError::Locked) => {},
         _ => { assert!(false); },
     }
 
-    resp_con.try_send(Box::new(move || {
+    resp_con.send(Box::new(move || {
         var2.fetch_add(1, Ordering::SeqCst);
-    }) as Task).ok().unwrap();
+    }) as Task);
 
     match rqst_con.try_receive() {
         Ok(task) => {

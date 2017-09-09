@@ -53,10 +53,10 @@ fn test_multi_threaded_one_requester_two_responders() {
             }
             
             match resp.try_respond() {
-                Ok(mut contract) => {
-                    contract.try_send(Box::new(move || {
+                Ok(contract) => {
+                    contract.send(Box::new(move || {
                         var2.fetch_add(1, Ordering::SeqCst);
-                    }) as Task).ok().unwrap();
+                    }) as Task);
                     break;
                 },
                 Err(TryRespondError::NoRequest) => {},
@@ -72,10 +72,10 @@ fn test_multi_threaded_one_requester_two_responders() {
             }
             
             match resp2.try_respond() {
-                Ok(mut contract) => {
-                    contract.try_send(Box::new(move || {
+                Ok(contract) => {
+                    contract.send(Box::new(move || {
                         var3.fetch_add(2, Ordering::SeqCst);
-                    }) as Task).ok().unwrap();
+                    }) as Task);
                     break;
                 },
                 Err(TryRespondError::NoRequest) => {},

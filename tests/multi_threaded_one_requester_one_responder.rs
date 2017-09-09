@@ -27,10 +27,10 @@ fn test_request_receive_threaded() {
     let handle = thread::spawn(move || {
         loop {
             match resp.try_respond() {
-                Ok(mut contract) => {
-                    contract.try_send(Box::new(move || {
+                Ok(contract) => {
+                    contract.send(Box::new(move || {
                         var2.fetch_add(1, Ordering::SeqCst);
-                    }) as Task).ok().unwrap();
+                    }) as Task);
                     break;
                 },
                 Err(TryRespondError::NoRequest) => {},
@@ -81,10 +81,10 @@ fn test_request_threaded_receive() {
 
     loop {
         match resp.try_respond() {
-            Ok(mut contract) => {
-                contract.try_send(Box::new(move || {
+            Ok(contract) => {
+                contract.send(Box::new(move || {
                     var2.fetch_add(1, Ordering::SeqCst);
-                }) as Task).ok().unwrap();
+                }) as Task);
                 break;
             },
             Err(TryRespondError::NoRequest) => {},
@@ -122,10 +122,10 @@ fn test_request_threaded_receive_threaded() {
     let handle2 = thread::spawn(move || {
         loop {
             match resp.try_respond() {
-                Ok(mut contract) => {
-                    contract.try_send(Box::new(move || {
+                Ok(contract) => {
+                    contract.send(Box::new(move || {
                         var2.fetch_add(1, Ordering::SeqCst);
-                    }) as Task).ok().unwrap();
+                    }) as Task);
                     break;
                 },
                 Err(TryRespondError::NoRequest) => {},

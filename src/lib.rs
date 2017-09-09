@@ -33,7 +33,7 @@
 //! let mut request_contract = requester.try_request().unwrap();
 //!
 //! // Respond with number.
-//! responder.try_respond().unwrap().try_send(5).ok().unwrap();
+//! responder.try_respond().unwrap().send(5);
 //!
 //! // Receive and print number.
 //! println!("Number is {}", request_contract.try_receive().unwrap());
@@ -135,8 +135,8 @@
 //!         // Send `task` to `receiver` if it has issued a request.
 //!         match responder2.try_respond() {
 //!             // `responder2` can respond to request.
-//!             Ok(mut contract) => {
-//!                 contract.try_send(tasks.pop().unwrap()).ok().unwrap();
+//!             Ok(contract) => {
+//!                 contract.send(tasks.pop().unwrap());
 //!                 break;
 //!             },
 //!             // Either `requester` has not yet made a request,
@@ -163,8 +163,8 @@
 //!         // Send `task` to `receiver` if it has issued a request.
 //!         match responder.try_respond() {
 //!             // `responder2` can respond to request.
-//!             Ok(mut contract) => {
-//!                 contract.try_send(tasks.pop().unwrap()).ok().unwrap();
+//!             Ok(contract) => {
+//!                 contract.send(tasks.pop().unwrap());
 //!                 break;
 //!             },
 //!             // Either `requester` has not yet made a request,
@@ -248,7 +248,7 @@ impl<T> Requester<T> {
     /// //     _ => unreachable!(),
     /// // }
     ///
-    /// responder.try_respond().unwrap().try_send(5).ok().unwrap();
+    /// responder.try_respond().unwrap().send(5);
     /// println!("Got number {}", request_contract.try_receive().unwrap());
     /// ```
     pub fn try_request(&self) -> Result<RequestContract<T>, TryRequestError> {
@@ -301,7 +301,7 @@ impl<T> RequestContract<T> {
     ///     _ => unreachable!(),
     /// }
     /// 
-    /// responder.try_respond().unwrap().try_send(5).ok().unwrap();
+    /// responder.try_respond().unwrap().send(6);
     /// 
     /// // The responder has responded now.
     /// match request_contract.try_receive() {
@@ -365,7 +365,7 @@ impl<T> RequestContract<T> {
     /// {
     ///     let mut request_contract = requester.try_request().unwrap();
     ///
-    ///     responder.try_respond().unwrap().try_send(5).ok().unwrap();
+    ///     responder.try_respond().unwrap().send(7);
     ///
     ///     // It is too late to cancel the request!
     ///     if !request_contract.try_cancel() {
@@ -444,7 +444,7 @@ impl<T> Responder<T> {
     ///     _ => unreachable!(),
     /// }
     ///
-    /// response_contract.try_send(5).ok().unwrap();
+    /// response_contract.send(8);
     /// 
     /// println!("Number is {}", request_contract.try_receive().unwrap());
     /// ```
@@ -488,16 +488,12 @@ pub struct ResponseContract<T> {
 
 impl<T> ResponseContract<T> {
     /// This method tries to send a datum to the requesting end of the channel.
+    /// It will then consume itself, thereby freeing the responding side of
+    /// the channel.
     ///
     /// # Arguments
     ///
     /// * `datum` - The item(s) to send
-    ///
-    /// # Warning
-    ///
-    /// It returns `Err(TrySendError::Done(datum))` if the user called it
-    /// after sending data once. The error also contains the datum the user
-    /// tried to send. Therefore, the system does not "eat" unsent data.
     ///
     /// # Example
     /// 
@@ -511,37 +507,20 @@ impl<T> ResponseContract<T> {
     /// let mut response_contract = responder.try_respond().unwrap();
     ///
     /// // We send data to the requesting end.
-    /// response_contract.try_send(9).ok().unwrap();
+    /// response_contract.send(9);
     ///
-    /// // The response contract returns an error if we try to send
-    /// // data more than once. It also returns the data
-    /// match response_contract.try_send(10) {
-    ///     Err(chan::TrySendError::Done(num)) => {
-    ///         println!("We can send data only once per request!");
-    ///         println!("The number we tried to send is {}", num);
-    ///     },
-    ///     _ => unreachable!(),
-    /// }
-    /// 
     /// println!("Number is {}", request_contract.try_receive().unwrap());
     /// ```
-    pub fn try_send(&mut self, datum: T) -> Result<(), TrySendError<T>>  {
-        // Do not try to send data if the contract already sent a datum.
-        if self.done {
-            return Err(TrySendError::Done(datum));
-        }
-
+    pub fn send(mut self, datum: T) {
         self.inner.set_datum(datum);
         self.done = true;
-
-        Ok(())
     }
 }
 
 impl<T> Drop for ResponseContract<T> {
     fn drop(&mut self) {
         if !self.done {
-            panic!("Dropping ResponseContract without sending data");
+            panic!("Dropping ResponseContract without sending data!");
         }
 
         self.inner.unlock_response();
@@ -600,7 +579,7 @@ impl<T> Inner<T> {
     ///
     /// * self.has_response_lock == true
     ///
-    /// * self.datum.get().is_none() == true
+    /// * (*self.datum.get()).is_none() == true
     ///
     /// * self.has_datum == false
     #[inline]
@@ -624,7 +603,7 @@ impl<T> Inner<T> {
     ///
     /// * self.has_request_lock == true
     ///
-    /// * if self.has_datum == true then self.datum.get().is_some() == true
+    /// * if self.has_datum == true then (*self.datum.get()).is_some() == true
     #[inline]
     fn try_get_datum(&self) -> Result<T, TryReceiveError> {
         // First check to see if data exists.
@@ -689,10 +668,6 @@ pub enum TryReceiveError {
 pub enum TryRespondError {
     NoRequest,
     Locked,
-}
-
-pub enum TrySendError<T> {
-    Done(T),
 }
 
 #[cfg(test)]
@@ -1030,44 +1005,14 @@ mod tests {
     }
 
     #[test]
-    fn test_response_contract_try_send() {
+    fn test_response_contract_send() {
         let (rqst, resp) = channel::<Task>();
 
         rqst.inner.flag_request();
 
-        let mut contract = resp.try_respond().unwrap();
+        let contract = resp.try_respond().unwrap();
 
-        contract.try_send(Box::new(move || { println!("Hello World!"); }) as Task).ok().unwrap();
-
-        assert_eq!(contract.done, true);
-    }
-
-    #[test]
-    fn test_response_contract_try_send_already_sent() {
-        let (rqst, resp) = channel::<Task>();
-
-        let var = Arc::new(AtomicUsize::new(0));
-        let var2 = var.clone();
-
-        let task1 = Box::new(move || { println!("Hello World!"); }) as Task;
-        let task2 = Box::new(move || {
-            var2.fetch_add(1, Ordering::SeqCst);
-        }) as Task;
-
-        rqst.inner.flag_request();
-
-        let mut contract = resp.try_respond().unwrap();
-
-        contract.try_send(task1).ok().unwrap();
-
-        match contract.try_send(task2) {
-            Err(TrySendError::Done(task)) => {
-                task.call_box();
-            },
-            _ => { assert!(false); },
-        }
-
-        assert_eq!(var.load(Ordering::SeqCst), 1);
+        contract.send(Box::new(move || { println!("Hello World!"); }) as Task);
     }
 
     #[test]
