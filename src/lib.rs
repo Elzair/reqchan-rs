@@ -1,8 +1,20 @@
-//! This crate defines a channel for requesting and receiving data.
+//! This crate defines a channel for requesting and receiving data. Each
+//! channel has only one requesting end, but it can have multiple responding
+//! ends. It is useful for implementing work sharing.
 //!
-//! It is useful for requesting and then receiving a datum from other threads.
+//! The two ends of the channel are asynchronous with respect to each other,
+//! so it is kinda nonblocking. However, if multiple responding ends try to 
+//! respond to the same request, only one will succeed; the rest will
+//! return errors.  
 //!
-//! Each channel has only one `Requester`, but it can have multiple `Responder`s.
+//! # Design
+//!
+//! `reqchan` is built around the two halves of the channel: `Requester`
+//! and `Responder`. Both implement methods that, when succesful, return
+//! contracts which function as lock-guards (and also, in the case of
+//! `RequestContract`, futures). These contracts **require** the user to
+//! either successfully receive data or cancel requests (on the receiving
+//! end) or send data (on the responding end).
 //!
 //! # Examples 
 //! 
@@ -30,6 +42,12 @@
 //! ## More Complex Example 
 //!
 //! This more complex example demonstrates more "real-world" usage.
+//! One thread requests a 'task' (i.e. a closure to run), and the
+//! other two threads fight over who gets to respond with their
+//! own personal task. Meanwhile, the requesting thread is polling
+//! for a task, and if it gets one in time, it runs it. Regardless of
+//! whether or not the receiver got a task or timed out, the receiver
+//! notifies other threads to stop running, and stops itself.
 //!
 //! ```
 //! extern crate reqchan as chan;
@@ -39,7 +57,7 @@
 //! use std::thread;
 //! use std::time::{Duration, Instant};
 //! 
-//! // Stuff required to pass functions around.
+//! // Stuff to make it easier to pass around closures.
 //! trait FnBox {
 //!     fn call_box(self: Box<Self>);
 //! }
@@ -162,9 +180,8 @@
 //! responder_1_handle.join().unwrap();
 //! responder_2_handle.join().unwrap();
 //!
-//! // Ensure receiving thread executed the task.
+//! // `num` can be 0, 1 or 2.
 //! let num = test_var.load(Ordering::SeqCst);
-//! assert!(num > 0);
 //! println!("Number is {}", num);
 //! ```
 
