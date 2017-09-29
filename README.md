@@ -22,27 +22,29 @@ The two ends of the channel are asynchronous with respect to each other, so it i
 
 This simple, single-threaded example demonstrates most of the API. The only thing left out is `RequestContract::try_cancel()`.
 
-```
+```rust
 extern crate reqchan;
 
-// Create channel.
-let (requester, responder) = reqchan::channel::<u32>(); 
-
-// Issue request.
-let mut request_contract = requester.try_request().unwrap();
-
-// Respond with number.
-responder.try_respond().unwrap().send(5);
-
-// Receive and print number.
-println!("Number is {}", request_contract.try_receive().unwrap());
+fn main() {
+    // Create channel.
+    let (requester, responder) = reqchan::channel::<u32>(); 
+    
+    // Issue request.
+    let mut request_contract = requester.try_request().unwrap();
+    
+    // Respond with number.
+    responder.try_respond().unwrap().send(5);
+    
+    // Receive and print number.
+    println!("Number is {}", request_contract.try_receive().unwrap());
+}
 ```
 
 ## More Complex Example 
 
 This more complex example demonstrates more "real-world" usage. One thread requests a 'task' (i.e. a closure to run), and the other two threads fight over who gets to respond with their own personal task. Meanwhile, the requesting thread is polling for a task, and if it gets one in time, it runs it. Regardless of whether or not the receiver got a task or timed out, the receiver notifies other threads to stop running, and stops itself.
 
-```
+```rust
 extern crate reqchan as chan;
 
 use std::sync::Arc;
@@ -61,119 +63,121 @@ impl<F: FnOnce()> FnBox for F {
 }
 type Task = Box<FnBox + Send + 'static>;
 
-// Variable used to test calling a `Task` sent between threads.
-let test_var = Arc::new(AtomicUsize::new(0));
-let test_var2 = test_var.clone();
-let test_var3 = test_var.clone();
-
-// Variable needed to stop `responder` thread if `requester` times out
-let should_exit = Arc::new(AtomicBool::new(false));
-let should_exit_copy_1 = should_exit.clone();
-let should_exit_copy_2 = should_exit.clone();
-
-let (requester, responder) = chan::channel::<Task>();
-let responder2 = responder.clone();
-
-// requesting thread
-let requester_handle = thread::spawn(move || {
-    let start_time = Instant::now();
-    let timeout = Duration::new(0, 1000000);
+fn main() {
+    // Variable used to test calling a `Task` sent between threads.
+    let test_var = Arc::new(AtomicUsize::new(0));
+    let test_var2 = test_var.clone();
+    let test_var3 = test_var.clone();
     
-    let mut contract = requester.try_request().unwrap();
-
-    loop {
-        // Try to cancel request and stop threads if runtime
-        // has exceeded `timeout`.
-        if start_time.elapsed() >= timeout {
-            // Try to cancel request.
-            // This should only fail if `responder` has started responding.
-            if contract.try_cancel() {
-                // Notify other threads to stop.
-                should_exit.store(true, Ordering::SeqCst);
-                break;
+    // Variable needed to stop `responder` thread if `requester` times out
+    let should_exit = Arc::new(AtomicBool::new(false));
+    let should_exit_copy_1 = should_exit.clone();
+    let should_exit_copy_2 = should_exit.clone();
+    
+    let (requester, responder) = chan::channel::<Task>();
+    let responder2 = responder.clone();
+    
+    // requesting thread
+    let requester_handle = thread::spawn(move || {
+        let start_time = Instant::now();
+        let timeout = Duration::new(0, 1000000);
+        
+        let mut contract = requester.try_request().unwrap();
+    
+        loop {
+            // Try to cancel request and stop threads if runtime
+            // has exceeded `timeout`.
+            if start_time.elapsed() >= timeout {
+                // Try to cancel request.
+                // This should only fail if `responder` has started responding.
+                if contract.try_cancel() {
+                    // Notify other threads to stop.
+                    should_exit.store(true, Ordering::SeqCst);
+                    break;
+                }
+            }
+    
+            // Try getting `task` from `responder`.
+            match contract.try_receive() {
+                // `contract` received `task`.
+                Ok(task) => {
+                    task.call_box();
+                    // Notify other threads to stop.
+                    should_exit.store(true, Ordering::SeqCst);
+                    break;
+                },
+                // Continue looping if `responder` has not yet sent `task`.
+                Err(chan::TryReceiveError::Empty) => {},
+                // The only other error is `chan::TryReceiveError::Done`.
+                // This only happens if we call `contract.try_receive()`
+                // after either receiving data or cancelling the request.
+                _ => unreachable!(),
             }
         }
-
-        // Try getting `task` from `responder`.
-        match contract.try_receive() {
-            // `contract` received `task`.
-            Ok(task) => {
-                task.call_box();
-                // Notify other threads to stop.
-                should_exit.store(true, Ordering::SeqCst);
-                break;
-            },
-            // Continue looping if `responder` has not yet sent `task`.
-            Err(chan::TryReceiveError::Empty) => {},
-            // The only other error is `chan::TryReceiveError::Done`.
-            // This only happens if we call `contract.try_receive()`
-            // after either receiving data or cancelling the request.
-            _ => unreachable!(),
-        }
-    }
-});
-
-// responding thread 1
-let responder_1_handle = thread::spawn(move || {
-    let mut tasks = vec![Box::new(move || {
-        test_var2.fetch_add(1, Ordering::SeqCst);
-    }) as Task];
+    });
     
-    loop {
-        // Exit loop if `receiver` has timed out.
-        if should_exit_copy_1.load(Ordering::SeqCst) {
-            break;
-        }
+    // responding thread 1
+    let responder_1_handle = thread::spawn(move || {
+        let mut tasks = vec![Box::new(move || {
+            test_var2.fetch_add(1, Ordering::SeqCst);
+        }) as Task];
         
-        // Send `task` to `receiver` if it has issued a request.
-        match responder2.try_respond() {
-            // `responder2` can respond to request.
-            Ok(contract) => {
-                contract.send(tasks.pop().unwrap());
+        loop {
+            // Exit loop if `receiver` has timed out.
+            if should_exit_copy_1.load(Ordering::SeqCst) {
                 break;
-            },
-            // Either `requester` has not yet made a request,
-            // or `responder2` already handled the request.
-            Err(chan::TryRespondError::NoRequest) => {},
-            // `responder2` is processing request..
-            Err(chan::TryRespondError::Locked) => { break; },
+            }
+            
+            // Send `task` to `receiver` if it has issued a request.
+            match responder2.try_respond() {
+                // `responder2` can respond to request.
+                Ok(contract) => {
+                    contract.send(tasks.pop().unwrap());
+                    break;
+                },
+                // Either `requester` has not yet made a request,
+                // or `responder2` already handled the request.
+                Err(chan::TryRespondError::NoRequest) => {},
+                // `responder2` is processing request..
+                Err(chan::TryRespondError::Locked) => { break; },
+            }
         }
-    }
-});
-
-// responding thread 2
-let responder_2_handle = thread::spawn(move || {
-    let mut tasks = vec![Box::new(move || {
-        test_var3.fetch_add(2, Ordering::SeqCst);
-    }) as Task];
+    });
     
-    loop {
-        // Exit loop if `receiver` has timed out.
-        if should_exit_copy_2.load(Ordering::SeqCst) {
-            break;
-        }
+    // responding thread 2
+    let responder_2_handle = thread::spawn(move || {
+        let mut tasks = vec![Box::new(move || {
+            test_var3.fetch_add(2, Ordering::SeqCst);
+        }) as Task];
         
-        // Send `task` to `receiver` if it has issued a request.
-        match responder.try_respond() {
-            // `responder2` can respond to request.
-            Ok(contract) => {
-                contract.send(tasks.pop().unwrap());
+        loop {
+            // Exit loop if `receiver` has timed out.
+            if should_exit_copy_2.load(Ordering::SeqCst) {
                 break;
-            },
-            // Either `requester` has not yet made a request,
-            // or `responder` already handled the request.
-            Err(chan::TryRespondError::NoRequest) => {},
-            // `responder` is processing request.
-            Err(chan::TryRespondError::Locked) => { break; },
+            }
+            
+            // Send `task` to `receiver` if it has issued a request.
+            match responder.try_respond() {
+                // `responder2` can respond to request.
+                Ok(contract) => {
+                    contract.send(tasks.pop().unwrap());
+                    break;
+                },
+                // Either `requester` has not yet made a request,
+                // or `responder` already handled the request.
+                Err(chan::TryRespondError::NoRequest) => {},
+                // `responder` is processing request.
+                Err(chan::TryRespondError::Locked) => { break; },
+            }
         }
-    }
-});
-
-requester_handle.join().unwrap();
-responder_1_handle.join().unwrap();
-responder_2_handle.join().unwrap();
-
-// `num` can be 0, 1 or 2.
-let num = test_var.load(Ordering::SeqCst);
-println!("Number is {}", num);
+    });
+    
+    requester_handle.join().unwrap();
+    responder_1_handle.join().unwrap();
+    responder_2_handle.join().unwrap();
+    
+    // `num` can be 0, 1 or 2.
+    let num = test_var.load(Ordering::SeqCst);
+    println!("Number is {}", num);
+}
 ```

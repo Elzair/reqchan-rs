@@ -1,6 +1,6 @@
 [package]
 name = "reqchan"
-version = "0.5.6"
+version = "0.5.7"
 authors = ["Philip Woods <elzairthesorcerer@gmail.com>"]
 description = "This is a channel for requesting and receiving data. Each channel has only one requesting end, but it can have multiple responding ends. It is useful for implementing work sharing. The two ends of the channel are asynchronous with respect to each other, so it is kinda nonblocking. However, if multiple responding ends try to respond to the same request, only one will succeed; the rest will return errors."
 readme = "README.md"
