@@ -1,4 +1,13 @@
-`reqchan-rs` defines a channel for requesting and receiving data. Each channel has only one requesting end, but it can have multiple responding ends. It is useful for implementing work sharing.
+`reqchan-rs` defines a channel for requesting and receiving data. 
+
+[Documentation](https://docs.rs/reqchan)
+
+[![Linux Status](https://travis-ci.org/Elzair/reqchan-rs.svg?branch=master)](https://travis-ci.org/Elzair/reqchan-rs)
+[![Build status](https://ci.appveyor.com/api/projects/status/mjf748x86ecf0yip?svg=true)](https://ci.appveyor.com/project/Elzair/reqchan-rs)
+
+# Introduction
+
+Each channel has only one requesting end, but it can have multiple responding ends. It is useful for implementing work sharing.
 
 The two ends of the channel are asynchronous with respect to each other, so it is kinda nonblocking. However, if multiple responding ends try to respond to the same request, only one will succeed; the rest will return errors.
 
@@ -181,3 +190,35 @@ fn main() {
     println!("Number is {}", num);
 }
 ```
+
+# Platforms
+
+`reqchan-rs` should Work on Windows and any POSIX compatible system (Linux, Mac OSX, etc.).
+
+`reqchan-rs` is continuously tested on:
+  * `x86_64-unknown-linux-gnu` (Linux)
+  * `i686-unknown-linux-gnu`
+  * `x86_64-unknown-linux-musl` (Linux w/ [MUSL](https://www.musl-libc.org/))
+  * `i686-unknown-linux-musl`
+  * `x86_64-apple-darwin` (Mac OSX)
+  * `i686-apple-darwin`
+  * `x86_64-pc-windows-msvc` (Windows)
+  * `i686-pc-windows-msvc`
+  * `x86_64-pc-windows-gnu`
+  * `i686-pc-windows-gnu`
+
+`reqchan-rs` is continuously cross-compiled for:
+  * `arm-unknown-linux-gnueabihf`
+  * `aarch64-unknown-linux-gnu`
+  * `mips-unknown-linux-gnu`
+  * `aarch64-unknown-linux-musl`
+  * `i686-linux-android`
+  * `x86_64-linux-android`
+  * `arm-linux-androideabi`
+  * `aarch64-linux-android`
+  * `i386-apple-ios`
+  * `x86_64-apple-ios`
+  * `i686-unknown-freebsd`
+  * `x86_64-unknown-freebsd`
+  * `x86_64-unknown-netbsd`
+  * `asmjs-unknown-emscripten`
