@@ -31,7 +31,7 @@ fn test_multi_threaded_one_requester_two_responders() {
     let var3 = var.clone();
 
     let handle1 = thread::spawn(move || {
-        let mut contract = rqst.try_request().unwrap();
+        let mut contract = rqst.try_request().ok().unwrap();
 
         loop {
             match contract.try_receive() {
@@ -40,8 +40,9 @@ fn test_multi_threaded_one_requester_two_responders() {
                     exit.store(true, Ordering::SeqCst);
                     break;
                 },
-                Err(TryReceiveError::Empty) => {},
-                Err(TryReceiveError::Done) => { assert!(false); },
+                Err(Error::Empty) => {},
+                Err(Error::Done) => { assert!(false); },
+                _ => unreachable!(),
             }
         }
     });
@@ -59,8 +60,9 @@ fn test_multi_threaded_one_requester_two_responders() {
                     }) as Task);
                     break;
                 },
-                Err(TryRespondError::NoRequest) => {},
-                Err(TryRespondError::Locked) => { break; },
+                Err(Error::NoRequest) => {},
+                Err(Error::AlreadyLocked) => { break; },
+                _ => unreachable!(),
             }
         }
     });
@@ -78,8 +80,9 @@ fn test_multi_threaded_one_requester_two_responders() {
                     }) as Task);
                     break;
                 },
-                Err(TryRespondError::NoRequest) => {},
-                Err(TryRespondError::Locked) => { break; },
+                Err(Error::NoRequest) => {},
+                Err(Error::AlreadyLocked) => { break; },
+                _ => unreachable!(),
             }
         }
     });

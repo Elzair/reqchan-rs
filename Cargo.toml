@@ -1,8 +1,8 @@
 [package]
 name = "reqchan"
-version = "0.5.8"
+version = "0.6.0"
 authors = ["Philip Woods <elzairthesorcerer@gmail.com>"]
-description = "This is a channel for requesting and receiving data. Each channel has only one requesting end, but it can have multiple responding ends. It is useful for implementing work sharing. The two ends of the channel are asynchronous with respect to each other, so it is kinda nonblocking. However, if multiple responding ends try to respond to the same request, only one will succeed; the rest will return errors."
+description = "This is a channel for requesting and receiving data."
 readme = "README.md"
 license = "MIT/Apache-2.0"
 documentation = "https://docs.rs/reqchan/"
@@ -10,5 +10,9 @@ homepage = "https://github.com/Elzair/reqchan-rs"
 repository = "https://github.com/Elzair/reqchan-rs"
 keywords = ["chan", "channel", "requests"]
 categories = ["asynchronous", "data-structures"]
+
+[badges]
+travis-ci = { repository = "Elzair/reqchan-rs" }
+appveyor = { repository = "Elzair/reqchan-rs" }
 
 [dependencies]

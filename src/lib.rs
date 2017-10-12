@@ -48,20 +48,20 @@
 //! This simple, single-threaded example demonstrates most of the API.
 //! The only thing left out is `RequestContract::try_cancel()`.
 //!
-//! ```
+//! ```rust
 //! extern crate reqchan;
 //!
 //! // Create channel.
 //! let (requester, responder) = reqchan::channel::<u32>(); 
 //!
 //! // Issue request.
-//! let mut request_contract = requester.try_request().unwrap();
+//! let mut request_contract = requester.try_request().ok().unwrap();
 //!
 //! // Respond with number.
-//! responder.try_respond().unwrap().send(5);
+//! responder.try_respond().ok().unwrap().send(5);
 //!
 //! // Receive and print number.
-//! println!("Number is {}", request_contract.try_receive().unwrap());
+//! println!("Number is {}", request_contract.try_receive().ok().unwrap());
 //! ```
 //!
 //! ## More Complex Example 
@@ -74,7 +74,7 @@
 //! whether or not the receiver got a task or timed out, the receiver
 //! notifies other threads to stop running, and stops itself.
 //!
-//! ```
+//! ```rust
 //! extern crate reqchan as chan;
 //! 
 //! use std::sync::Arc;
@@ -111,7 +111,7 @@
 //!     let start_time = Instant::now();
 //!     let timeout = Duration::new(0, 1000000);
 //!     
-//!     let mut contract = requester.try_request().unwrap();
+//!     let mut contract = requester.try_request().ok().unwrap();
 //! 
 //!     loop {
 //!         // Try to cancel request and stop threads if runtime
@@ -119,7 +119,7 @@
 //!         if start_time.elapsed() >= timeout {
 //!             // Try to cancel request.
 //!             // This should only fail if `responder` has started responding.
-//!             if contract.try_cancel() {
+//!             if let Ok(_) = contract.try_cancel() {
 //!                 // Notify other threads to stop.
 //!                 should_exit.store(true, Ordering::SeqCst);
 //!                 break;
@@ -136,8 +136,8 @@
 //!                 break;
 //!             },
 //!             // Continue looping if `responder` has not yet sent `task`.
-//!             Err(chan::TryReceiveError::Empty) => {},
-//!             // The only other error is `chan::TryReceiveError::Done`.
+//!             Err(chan::Error::Empty) => {},
+//!             // The only other error is `chan::Error::Done`.
 //!             // This only happens if we call `contract.try_receive()`
 //!             // after either receiving data or cancelling the request.
 //!             _ => unreachable!(),
@@ -166,9 +166,10 @@
 //!             },
 //!             // Either `requester` has not yet made a request,
 //!             // or `responder2` already handled the request.
-//!             Err(chan::TryRespondError::NoRequest) => {},
+//!             Err(chan::Error::NoRequest) => {},
 //!             // `responder2` is processing request..
-//!             Err(chan::TryRespondError::Locked) => { break; },
+//!             Err(chan::Error::AlreadyLocked) => { break; },
+//!             _ => unreachable!(),
 //!         }
 //!     }
 //! });
@@ -194,9 +195,10 @@
 //!             },
 //!             // Either `requester` has not yet made a request,
 //!             // or `responder` already handled the request.
-//!             Err(chan::TryRespondError::NoRequest) => {},
+//!             Err(chan::Error::NoRequest) => {},
 //!             // `responder` is processing request.
-//!             Err(chan::TryRespondError::Locked) => { break; },
+//!             Err(chan::Error::AlreadyLocked) => { break; },
+//!             _ => unreachable!(),
 //!         }
 //!     }
 //! });
@@ -211,6 +213,7 @@
 //! ```
 
 use std::cell::UnsafeCell;
+use std::result;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -219,7 +222,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 ///
 /// # Example
 /// 
-/// ```
+/// ```rust
 /// extern crate reqchan;
 ///
 /// #[allow(unused_variables)]
@@ -256,31 +259,29 @@ impl<T> Requester<T> {
     ///
     /// # Example
     /// 
-    /// ```
+    /// ```rust
     /// extern crate reqchan as chan;
     ///
     /// let (requester, responder) = chan::channel::<u32>(); 
     ///
     /// // Create request.
-    /// let mut request_contract = requester.try_request().unwrap();
+    /// let mut request_contract = requester.try_request().ok().unwrap();
     /// 
     /// // We have to wait for `request_contract` to go out of scope
     /// // before we can make another request.
     /// // match requester.try_request() {
-    /// //     Err(chan::TryRequestError::Locked) => {
+    /// //     Err(chan::Error::AlreadyLocked) => {
     /// //         println!("We already have a request contract!");
     /// //     },
     /// //     _ => unreachable!(),
     /// // }
     ///
-    /// responder.try_respond().unwrap().send(5);
-    /// println!("Got number {}", request_contract.try_receive().unwrap());
+    /// responder.try_respond().ok().unwrap().send(5);
+    /// println!("Got number {}", request_contract.try_receive().ok().unwrap());
     /// ```
-    pub fn try_request(&self) -> Result<RequestContract<T>, TryRequestError> {
+    pub fn try_request(&self) -> Result<RequestContract<T>> {
         // First, try to lock the requesting side.
-        if !self.inner.try_lock_request() {
-            return Err(TryRequestError::Locked);
-        }
+        let _ = self.inner.try_lock_request()?;
 
         // Next, flag a request.
         self.inner.flag_request();
@@ -308,25 +309,25 @@ impl<T> RequestContract<T> {
     ///
     /// # Warning
     ///
-    /// It returns `Err(TryReceiveError::Done)` if the user called it
+    /// It returns `Err(Error::Done)` if the user called it
     /// after either receiving a datum or cancelling the request.
     ///
     /// # Example
     /// 
-    /// ```
+    /// ```rust
     /// extern crate reqchan as chan;
     ///
     /// let (requester, responder) = chan::channel::<u32>(); 
     ///
-    /// let mut request_contract = requester.try_request().unwrap();
+    /// let mut request_contract = requester.try_request().ok().unwrap();
     ///
     /// // The responder has not responded yet. 
     /// match request_contract.try_receive() {
-    ///     Err(chan::TryReceiveError::Empty) => { println!("No Data yet!"); },
+    ///     Err(chan::Error::Empty) => { println!("No Data yet!"); },
     ///     _ => unreachable!(),
     /// }
     /// 
-    /// responder.try_respond().unwrap().send(6);
+    /// responder.try_respond().ok().unwrap().send(6);
     /// 
     /// // The responder has responded now.
     /// match request_contract.try_receive() {
@@ -336,34 +337,26 @@ impl<T> RequestContract<T> {
     ///
     /// // We need to issue another request to receive more data.
     /// match request_contract.try_receive() {
-    ///     Err(chan::TryReceiveError::Done) => {
+    ///     Err(chan::Error::Done) => {
     ///         println!("We already received data!");
     ///     },
     ///     _ => unreachable!(),
     /// }
     /// ```
-    pub fn try_receive(&mut self) -> Result<T, TryReceiveError> {
+    pub fn try_receive(&mut self) -> Result<T> {
         // Do not try to receive anything if the contract already received data.
         if self.done {
-            return Err(TryReceiveError::Done);
+            return Err(Error::Done);
         }
 
-        match self.inner.try_get_datum() {
-            Ok(datum) => {
-                self.done = true;
-                Ok(datum)
-            },
-            Err(err) => Err(err),
-        }
+        let datum = self.inner.try_get_datum()?;
+        self.done = true;
+
+        Ok(datum)
     } 
 
     /// This method attempts to cancel a request. This is useful for
     /// implementing a timeout.
-    ///
-    /// # Return
-    ///
-    /// * `true` - Cancelled request
-    /// * `false` - `Responder` started processing request first
     ///
     /// # Warning
     ///
@@ -372,46 +365,52 @@ impl<T> RequestContract<T> {
     ///
     /// # Example
     /// 
-    /// ```
+    /// ```rust
     /// extern crate reqchan as chan;
     ///
     /// let (requester, responder) = chan::channel::<u32>(); 
     ///
     /// {
-    ///     let mut contract = requester.try_request().unwrap();
+    ///     let mut contract = requester.try_request().ok().unwrap();
     ///
     ///     // We can cancel the request since `responder` has not
     ///     // yet responded to it.
-    ///     assert_eq!(contract.try_cancel(), true);
+    ///     contract.try_cancel().ok().unwrap();
     ///
     ///     // Both contracts go out of scope here
     /// }
     ///
     /// {
-    ///     let mut request_contract = requester.try_request().unwrap();
+    ///     let mut request_contract = requester.try_request().ok().unwrap();
     ///
-    ///     responder.try_respond().unwrap().send(7);
+    ///     responder.try_respond().ok().unwrap().send(7);
     ///
     ///     // It is too late to cancel the request!
-    ///     if !request_contract.try_cancel() {
-    ///         println!("Number: {}", request_contract.try_receive().unwrap());
+    ///     match request_contract.try_cancel() {
+    ///         Err(chan::Error::TooLate) => {
+    ///             println!("Number: {}", request_contract.try_receive().unwrap());
+    ///         },
+    ///         _ => unimplemented!(),
     ///     }
     ///
     ///     // Both contracts go out of scope here
     /// }
     /// ```
-    pub fn try_cancel(&mut self) -> bool {
+    pub fn try_cancel(&mut self) -> Result<()> {
         // Do not try to unsend if the contract already received data.
         if self.done {
-            return false;
+            return Err(Error::Done);
         }
 
         match self.inner.try_unflag_request() {
-            true => {
+            Ok(()) => {
                 self.done = true;
-                true
+                Ok(())
             },
-            false => false,
+            Err(Error::NoRequest) => {
+                Err(Error::TooLate)
+            },
+            _ => unreachable!(),
         }
     }
 }
@@ -450,20 +449,20 @@ impl<T> Responder<T> {
     ///
     /// // `requester` has not yet issued a request.
     /// match responder.try_respond() {
-    ///     Err(chan::TryRespondError::NoRequest) => {
+    ///     Err(chan::Error::NoRequest) => {
     ///         println!("There is no request!");
     ///     },
     ///     _ => unreachable!(),
     /// }
     ///
-    /// let mut request_contract = requester.try_request().unwrap();
+    /// let mut request_contract = requester.try_request().ok().unwrap();
     ///
     /// // `requester` has issued a request.
-    /// let mut response_contract = responder.try_respond().unwrap();
+    /// let response_contract = responder.try_respond().ok().unwrap();
     ///
     /// // We cannot issue another response to the request.
     /// match responder.try_respond() {
-    ///     Err(chan::TryRespondError::Locked) => {
+    ///     Err(chan::Error::AlreadyLocked) => {
     ///         println!("We cannot issue multiple responses to a request!");
     ///     },
     ///     _ => unreachable!(),
@@ -471,27 +470,26 @@ impl<T> Responder<T> {
     ///
     /// response_contract.send(8);
     /// 
-    /// println!("Number is {}", request_contract.try_receive().unwrap());
+    /// println!("Number is {}", request_contract.try_receive().ok().unwrap());
     /// ```
-    pub fn try_respond(&self) -> Result<ResponseContract<T>,
-                                        TryRespondError> {
-
+    pub fn try_respond(&self) -> Result<ResponseContract<T>> {
         // First try to lock the responding side.
-        if !self.inner.try_lock_response() {
-            return Err(TryRespondError::Locked);
-        }
+        let _ = self.inner.try_lock_response()?;
         
         // Next, atomically check for a request and signal a response to it.
         // If no request exists, drop the lock and return the data.
-        if !self.inner.try_unflag_request() {
-            self.inner.unlock_response();
-            return Err(TryRespondError::NoRequest);
+        match self.inner.try_unflag_request() {
+            Ok(_) => {
+                Ok(ResponseContract {
+                    inner: self.inner.clone(),
+                    done: false,
+                })
+            },
+            Err(err) => {
+                self.inner.unlock_response();
+                Err(err)
+            },
         }
-     
-        Ok(ResponseContract {
-            inner: self.inner.clone(),
-            done: false,
-        })
     }
 }
 
@@ -527,9 +525,9 @@ impl<T> ResponseContract<T> {
     ///
     /// let (requester, responder) = chan::channel::<u32>(); 
     ///
-    /// let mut request_contract = requester.try_request().unwrap();
+    /// let mut request_contract = requester.try_request().ok().unwrap();
     ///
-    /// let mut response_contract = responder.try_respond().unwrap();
+    /// let mut response_contract = responder.try_respond().ok().unwrap();
     ///
     /// // We send data to the requesting end.
     /// response_contract.send(9);
@@ -551,6 +549,17 @@ impl<T> Drop for ResponseContract<T> {
         self.inner.unlock_response();
     }
 }
+
+#[derive(Debug)]
+pub enum Error {
+    AlreadyLocked,
+    Done,
+    Empty,
+    NoRequest,
+    TooLate,
+}
+
+pub type Result<T> = result::Result<T, Error>;
 
 #[doc(hidden)]
 struct Inner<T> {
@@ -582,12 +591,18 @@ impl<T> Inner<T> {
     /// This method atomically checks to see if the requesting end
     /// issued a request and unflag the request.
     #[inline]
-    fn try_unflag_request(&self) -> bool {
+    fn try_unflag_request(&self) -> Result<()> {
         let (old, new) = (true, false);
 
-        self.has_request.compare_and_swap(old,
-                                          new,
-                                          Ordering::SeqCst) == old
+        let res = self.has_request.compare_and_swap(old,
+                                                    new,
+                                                    Ordering::SeqCst);
+        if res == old {
+            Ok(())
+        }
+        else {
+            Err(Error::NoRequest)
+        }
     }
 
     /// This method sets the inner datum to the specified value.
@@ -630,7 +645,7 @@ impl<T> Inner<T> {
     ///
     /// * if self.has_datum == true then (*self.datum.get()).is_some() == true
     #[inline]
-    fn try_get_datum(&self) -> Result<T, TryReceiveError> {
+    fn try_get_datum(&self) -> Result<T> {
         // First check to see if data exists.
         let (old, new) = (true, false);
 
@@ -643,17 +658,28 @@ impl<T> Inner<T> {
             }
         }
         else {
-            Err(TryReceiveError::Empty)
+            Err(Error::Empty)
         }
     }
 
+    // TODO: Make locks Acquire and Release
+    
     /// This method tries to lock the requesting side of the channel.
     /// It returns a `boolean` indicating whether or not it succeeded.
     #[inline]
-    fn try_lock_request(&self) -> bool {
+    fn try_lock_request(&self) -> Result<()> {
         let (old, new) = (false, true);
 
-        self.has_request_lock.compare_and_swap(old, new, Ordering::SeqCst) == old
+        let res = self.has_request_lock.compare_and_swap(old,
+                                                         new,
+                                                         Ordering::SeqCst);
+
+        if res == old {
+            Ok(())
+        }
+        else {
+            Err(Error::AlreadyLocked)
+        }
     }
 
     /// This method unlocks the requesting side of the channel.
@@ -665,10 +691,19 @@ impl<T> Inner<T> {
     /// This method tries to lock the responding side of the channel.
     /// It returns a `boolean` indicating whether or not it succeeded.
     #[inline]
-    fn try_lock_response(&self) -> bool {
+    fn try_lock_response(&self) -> Result<()> {
         let (old, new) = (false, true);
 
-        self.has_response_lock.compare_and_swap(old, new, Ordering::SeqCst) == old
+        let res = self.has_response_lock.compare_and_swap(old,
+                                                          new,
+                                                          Ordering::SeqCst);
+
+        if res == old {
+            Ok(())
+        }
+        else {
+            Err(Error::AlreadyLocked)
+        }
     }
 
     /// This method unlocks the responding side of the channel.
@@ -676,23 +711,6 @@ impl<T> Inner<T> {
     fn unlock_response(&self) {
         self.has_response_lock.store(false, Ordering::SeqCst);
     }
-}
-
-#[derive(Debug)]
-pub enum TryRequestError {
-    Locked,
-}
-
-#[derive(Debug)]
-pub enum TryReceiveError {
-    Empty,
-    Done,
-}
-
-#[derive(Debug)]
-pub enum TryRespondError {
-    NoRequest,
-    Locked,
 }
 
 #[cfg(test)]
@@ -725,7 +743,11 @@ mod tests {
         #[allow(unused_variables)]
         let (rqst, resp) = channel::<Task>();
 
-        assert_eq!(rqst.inner.try_lock_request(), true);
+        match rqst.inner.try_lock_request() {
+            Ok(()) => {},
+            _ => { assert!(false); },
+        }
+
         assert_eq!(resp.inner.has_request_lock.load(Ordering::SeqCst), true);
     }
        
@@ -734,9 +756,12 @@ mod tests {
         #[allow(unused_variables)]
         let (rqst, resp) = channel::<Task>();
 
-        rqst.inner.try_lock_request();
+        rqst.inner.try_lock_request().ok().unwrap();
 
-        assert_eq!(rqst.inner.try_lock_request(), false);
+        match rqst.inner.try_lock_request() {
+            Err(Error::AlreadyLocked) => {},
+            _ => { assert!(false); },
+        }
     }
 
     #[test]
@@ -756,7 +781,11 @@ mod tests {
         #[allow(unused_variables)]
         let (rqst, resp) = channel::<Task>();
 
-        assert_eq!(rqst.inner.try_lock_response(), true);
+        match rqst.inner.try_lock_response() {
+            Ok(()) => {},
+            _ => { assert!(false); },
+        }
+
         assert_eq!(resp.inner.has_response_lock.load(Ordering::SeqCst), true);
     }
        
@@ -765,9 +794,12 @@ mod tests {
         #[allow(unused_variables)]
         let (rqst, resp) = channel::<Task>();
 
-        rqst.inner.try_lock_response();
+        rqst.inner.try_lock_response().ok().unwrap();
 
-        assert_eq!(rqst.inner.try_lock_response(), false);
+        match rqst.inner.try_lock_response() {
+            Err(Error::AlreadyLocked) => {},
+            _ => { assert!(false); },
+        }
     }
 
     #[test]
@@ -799,10 +831,17 @@ mod tests {
 
         resp.inner.has_request.store(true, Ordering::SeqCst);
 
-        assert_eq!(rqst.inner.try_unflag_request(), true);
+        match rqst.inner.try_unflag_request() {
+            Ok(()) => {},
+            _ => { assert!(false); },
+        }
+
         assert_eq!(resp.inner.has_request.load(Ordering::SeqCst), false);
 
-        assert_eq!(rqst.inner.try_unflag_request(), false);
+        match rqst.inner.try_unflag_request() {
+            Err(Error::NoRequest) => {},
+            _ => { assert!(false); },
+        }
     }
    
     #[test]
@@ -812,9 +851,12 @@ mod tests {
 
         resp.inner.has_request.store(true, Ordering::SeqCst);
 
-        rqst.inner.try_unflag_request();
+        rqst.inner.try_unflag_request().ok().unwrap();
 
-        assert_eq!(rqst.inner.try_unflag_request(), false);
+        match rqst.inner.try_unflag_request() {
+            Err(Error::NoRequest) => {},
+            _ => { assert!(false); },
+        }
     }
 
     #[test]
@@ -861,7 +903,7 @@ mod tests {
         let (rqst, resp) = channel::<Task>();
         
         match rqst.inner.try_get_datum() {
-            Err(TryReceiveError::Empty) => {}
+            Err(Error::Empty) => {}
             _ => { assert!(false); },
         }
     }
@@ -871,7 +913,7 @@ mod tests {
         #[allow(unused_variables)]
         let (rqst, resp) = channel::<Task>();
 
-        let mut contract = rqst.try_request().unwrap();
+        let mut contract = rqst.try_request().ok().unwrap();
 
         contract.done = true;
     }
@@ -881,10 +923,10 @@ mod tests {
         #[allow(unused_variables)]
         let (rqst, resp) = channel::<Task>();
 
-        rqst.inner.try_lock_request();
+        rqst.inner.try_lock_request().ok().unwrap();
 
         match rqst.try_request() {
-            Err(TryRequestError::Locked) => {},
+            Err(Error::AlreadyLocked) => {},
             _ => { assert!(false); },
         }
     }
@@ -900,7 +942,7 @@ mod tests {
             var2.fetch_add(1, Ordering::SeqCst);
         }) as Task;
 
-        let mut contract = rqst.try_request().unwrap();
+        let mut contract = rqst.try_request().ok().unwrap();
 
         resp.inner.set_datum(task);
 
@@ -920,10 +962,10 @@ mod tests {
         #[allow(unused_variables)]
         let (rqst, resp) = channel::<Task>();
 
-        let mut contract = rqst.try_request().unwrap();
+        let mut contract = rqst.try_request().ok().unwrap();
 
         match contract.try_receive() {
-            Err(TryReceiveError::Empty) => {},
+            Err(Error::Empty) => {},
             _ => { assert!(false); },
         }
 
@@ -937,12 +979,12 @@ mod tests {
         #[allow(unused_variables)]
         let (rqst, resp) = channel::<Task>();
 
-        let mut contract = rqst.try_request().unwrap();
+        let mut contract = rqst.try_request().ok().unwrap();
 
         contract.done = true;
 
         match contract.try_receive() {
-            Err(TryReceiveError::Done) => {},
+            Err(Error::Done) => {},
             _ => { assert!(false); },
         }
     }
@@ -952,9 +994,12 @@ mod tests {
         #[allow(unused_variables)]
         let (rqst, resp) = channel::<Task>();
 
-        let mut contract = rqst.try_request().unwrap();
+        let mut contract = rqst.try_request().ok().unwrap();
 
-        assert_eq!(contract.try_cancel(), true);
+        match contract.try_cancel() {
+            Ok(()) => {},
+            _ => { assert!(false); },
+        }
     }
 
     #[test]
@@ -962,11 +1007,15 @@ mod tests {
         #[allow(unused_variables)]
         let (rqst, resp) = channel::<Task>();
         
-        let mut contract = rqst.try_request().unwrap();
+        let mut contract = rqst.try_request().ok().unwrap();
 
-        rqst.inner.try_unflag_request();
+        rqst.inner.try_unflag_request().ok().unwrap();
 
-        assert_eq!(contract.try_cancel(), false);
+        match contract.try_cancel() {
+            Err(Error::TooLate) => {},
+            _ => { assert!(false); },
+        }
+
         assert_eq!(contract.done, false);
 
         contract.done = true;
@@ -977,11 +1026,14 @@ mod tests {
         #[allow(unused_variables)]
         let (rqst, resp) = channel::<Task>();
 
-        let mut contract = rqst.try_request().unwrap();
+        let mut contract = rqst.try_request().ok().unwrap();
 
         contract.done = true;
 
-        assert_eq!(contract.try_cancel(), false);
+        match contract.try_cancel() {
+            Err(Error::Done) => {},
+            _ => { assert!(false); },
+        }
     }
 
     #[test]
@@ -991,7 +1043,7 @@ mod tests {
         let (rqst, resp) = channel::<Task>();
 
         #[allow(unused_variables)]
-        let contract = rqst.try_request().unwrap();
+        let contract = rqst.try_request().ok().unwrap();
     }
 
     #[test]
@@ -1000,7 +1052,7 @@ mod tests {
         
         rqst.inner.flag_request();
 
-        let mut contract = resp.try_respond().unwrap();
+        let mut contract = resp.try_respond().ok().unwrap();
 
         contract.done = true;
     }
@@ -1011,7 +1063,7 @@ mod tests {
         let (rqst, resp) = channel::<Task>();
         
         match resp.try_respond() {
-            Err(TryRespondError::NoRequest) => {},
+            Err(Error::NoRequest) => {},
             _ => { assert!(false); },
         }
     }
@@ -1021,10 +1073,10 @@ mod tests {
         #[allow(unused_variables)]
         let (rqst, resp) = channel::<Task>();
 
-        resp.inner.try_lock_response();
+        let _ = resp.inner.try_lock_response().ok().unwrap();
         
         match resp.try_respond() {
-            Err(TryRespondError::Locked) => {},
+            Err(Error::AlreadyLocked) => {},
             _ => { assert!(false); },
         }
     }
@@ -1035,7 +1087,7 @@ mod tests {
 
         rqst.inner.flag_request();
 
-        let contract = resp.try_respond().unwrap();
+        let contract = resp.try_respond().ok().unwrap();
 
         contract.send(Box::new(move || { println!("Hello World!"); }) as Task);
     }
@@ -1047,6 +1099,6 @@ mod tests {
         let (rqst, resp) = channel::<Task>();
 
         #[allow(unused_variables)]
-        let contract = resp.try_respond().unwrap();
+        let contract = resp.try_respond().ok().unwrap();
     }
 }

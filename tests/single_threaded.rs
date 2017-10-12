@@ -26,8 +26,8 @@ fn test_multiple_requests() {
 
     // Scope of first set of contracts
     {
-        let mut rqst_con = rqst.try_request().unwrap();
-        let resp_con = resp.try_respond().unwrap();
+        let mut rqst_con = rqst.try_request().ok().unwrap();
+        let resp_con = resp.try_respond().ok().unwrap();
 
         resp_con.send(Box::new(move || {
             var2.fetch_add(1, Ordering::SeqCst);
@@ -47,8 +47,8 @@ fn test_multiple_requests() {
 
     // Scope of second set of contracts
     {
-        let mut rqst_con = rqst.try_request().unwrap();
-        let resp_con = resp.try_respond().unwrap();
+        let mut rqst_con = rqst.try_request().ok().unwrap();
+        let resp_con = resp.try_respond().ok().unwrap();
 
         resp_con.send(Box::new(move || {
             var3.fetch_add(1, Ordering::SeqCst);
@@ -75,11 +75,11 @@ fn test_multiple_responders() {
     let var = Arc::new(AtomicUsize::new(0));
     let var2 = var.clone();
     
-    let mut rqst_con = rqst.try_request().unwrap();
-    let resp_con = resp.try_respond().unwrap();
+    let mut rqst_con = rqst.try_request().ok().unwrap();
+    let resp_con = resp.try_respond().ok().unwrap();
 
     match resp2.try_respond() {
-        Err(TryRespondError::Locked) => {},
+        Err(Error::AlreadyLocked) => {},
         _ => { assert!(false); },
     }
 
